@@ -1,13 +1,14 @@
 """
-Pydantic request/response models for the Phase 1 (auth + basic chat) and
-Phase 2 (document upload + library) endpoints.
+Pydantic request/response models for the Phase 1 (auth + basic chat),
+Phase 2 (document upload + library), and Phase 3 (retrieval + query
+routing) endpoints.
 """
 
 import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
@@ -28,7 +29,8 @@ class ChatMessageRequest(BaseModel):
 class ChatMessageResponse(BaseModel):
     conversation_id: uuid.UUID
     reply: str
-    used_documents: bool  # always False in Phase 1 -- no retrieval yet
+    used_documents: bool  # True when routed to the knowledge base (spec §3.4)
+    sources: list[str] = Field(default_factory=list)  # filenames used, [] if general knowledge
 
 
 class ChatHistoryItem(BaseModel):
@@ -55,3 +57,15 @@ class DocumentListItem(BaseModel):
     uploaded_by: Optional[str] = None
     uploaded_at: datetime
     chunk_count: int
+
+
+class DebugRetrievalChunk(BaseModel):
+    filename: str
+    score: float
+    chunk_text: str
+
+
+class DebugRetrievalResponse(BaseModel):
+    query: str
+    threshold: float
+    matches: list[DebugRetrievalChunk]

@@ -64,5 +64,22 @@ class Settings(BaseSettings):
     # --- Upload limits (Phase 2, spec §7) ---
     MAX_UPLOAD_SIZE_MB: int = 25
 
+    # --- Retrieval / query routing (Phase 3, spec §3.3/§3.4) ---
+    # Cosine similarity cutoff a chunk must clear before the assistant
+    # answers from the knowledge base instead of general knowledge --
+    # this threshold *is* the query router. The skip-on-low-score logic
+    # itself (app/services/retrieval.py) was always correct; 0.5 just
+    # wasn't strict enough in practice. Local MiniLM embeddings are known
+    # to be "anisotropic" -- cosine similarity between two *unrelated*
+    # short texts commonly lands in the 0.3-0.5 range rather than near 0
+    # (unlike larger hosted models), so a genuinely irrelevant document
+    # can clear a 0.5 bar. Raised to 0.65 after an observed false-positive
+    # match (an unrelated question routed to two clearly unrelated
+    # documents that both scored ~0.50-0.53). Keep tuning it against real
+    # usage via the routing log line each chat message produces, or
+    # GET /api/chat/debug-retrieval.
+    SIMILARITY_THRESHOLD: float = 0.65
+    TOP_K_CHUNKS: int = 5
+
 
 settings = Settings()
