@@ -1,7 +1,8 @@
 """
 Pydantic request/response models for the Phase 1 (auth + basic chat),
-Phase 2 (document upload + library), and Phase 3 (retrieval + query
-routing) endpoints.
+Phase 2 (document upload + library), Phase 3 (retrieval + query routing),
+and Phase 5 (data management -- clear knowledge base / clear chat
+history, spec §3.6) endpoints.
 """
 
 import uuid
@@ -69,3 +70,31 @@ class DebugRetrievalResponse(BaseModel):
     query: str
     threshold: float
     matches: list[DebugRetrievalChunk]
+
+
+class AccountListItem(BaseModel):
+    id: int
+    display_name: Optional[str] = None
+
+
+class ClearKnowledgeBaseRequest(BaseModel):
+    # Server-side enforced, not just a UI gate (spec §3.3: "type DELETE to
+    # confirm") -- a direct API call without this exact literal is
+    # rejected too.
+    confirm: str
+
+
+class ClearKnowledgeBaseResponse(BaseModel):
+    documents_deleted: int
+    chunks_deleted: int
+
+
+class ClearChatHistoryRequest(BaseModel):
+    # Either account can clear its own or the other account's history
+    # (spec §3.5); one or more ids in a single call.
+    user_ids: list[int]
+
+
+class ClearChatHistoryResponse(BaseModel):
+    messages_deleted: int
+    cleared_user_ids: list[int]
