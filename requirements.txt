@@ -1,0 +1,35 @@
+# --- Web framework ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- SQL Server connectivity ---
+pyodbc>=5.1
+sqlalchemy>=2.0
+
+# --- Auth (Entra ID + JWT) ---
+msal>=1.28
+PyJWT>=2.8
+cryptography>=42.0
+
+# --- File upload / parsing ---
+python-multipart>=0.0.9
+pypdf>=4.2
+python-docx>=1.1
+openpyxl>=3.1
+pandas>=2.2
+
+# --- Embeddings + similarity search ---
+numpy>=1.26
+voyageai>=0.2          # or swap for your chosen embedding provider's SDK
+
+# --- Anthropic Claude API ---
+anthropic>=0.34
+
+# --- OneDrive / Microsoft Graph ---
+requests>=2.31
+
+# --- GitHub connector ---
+PyGithub>=2.3
+
+# --- Config / environment ---
+python-dotenv>=1.0
