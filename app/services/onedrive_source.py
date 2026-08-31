@@ -1,0 +1,159 @@
+"""
+OneDrive/SharePoint connector (spec §3.2, §8 item 4): paste a shared
+folder link. The frontend already holds a live MSAL session (the same
+Entra app registration used for login, spec §3.1), so it fetches a
+short-lived Microsoft Graph access token for the Files.Read scope and
+sends it along with the link on every call -- nothing OneDrive-specific
+is stored server-side except the resolved folder reference itself
+(drive_id/item_id/path), never a token. That's not a shortcut: a SPA
+(public client) app registration can't refresh a Graph token server-side
+without a client secret, so there is no long-lived credential to persist
+for OneDrive the way GitHub's PAT is persisted.
+
+graph.microsoft.com is unreachable from the sandbox this was built in
+(same block as huggingface.co/api.openai.com) -- this module is verified
+via mocked Graph responses against the real route/service code. A live
+Graph token and the Files.Read delegated permission added to the Entra
+app registration are both required before this works end to end.
+"""
+
+import base64
+from dataclasses import dataclass
+
+import requests
+
+from app.config import settings
+from app.services.parsing import SUPPORTED_EXTENSIONS
+
+_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_MAX_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+
+class OneDriveConnectionError(RuntimeError):
+    pass
+
+
+@dataclass
+class OneDriveFileRef:
+    item_id: str
+    path: str
+    size: int
+
+
+def _encode_share_id(shared_link: str) -> str:
+    # https://learn.microsoft.com/en-us/graph/api/shares-get -- a sharing
+    # URL becomes an addressable "shares" resource via base64url(url),
+    # prefixed with "u!" and with the "=" padding stripped.
+    b64 = base64.urlsafe_b64encode(shared_link.strip().encode("utf-8")).decode("ascii")
+    return "u!" + b64.rstrip("=")
+
+
+def _headers(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def _raise_for_response(resp: requests.Response, action: str) -> None:
+    if resp.status_code == 401:
+        raise OneDriveConnectionError(
+            "The Microsoft Graph token was rejected (expired, or missing the Files.Read scope)."
+        )
+    if resp.status_code == 404:
+        raise OneDriveConnectionError(f"Not found while {action} (404 from Microsoft Graph).")
+    if not resp.ok:
+        raise OneDriveConnectionError(
+            f"Microsoft Graph error while {action}: {resp.status_code} {resp.text[:200]}"
+        )
+
+
+def resolve_shared_folder(access_token: str, shared_link: str) -> dict:
+    """
+    Resolves a pasted sharing link to a Graph driveItem. Raises
+    OneDriveConnectionError with a clean message on any failure, or if the
+    link points to a file rather than a folder.
+    """
+    if not shared_link or not shared_link.strip():
+        raise OneDriveConnectionError("Paste a OneDrive or SharePoint shared-folder link.")
+
+    share_id = _encode_share_id(shared_link)
+    url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem"
+    resp = requests.get(url, headers=_headers(access_token), timeout=30)
+    if resp.status_code == 404:
+        raise OneDriveConnectionError(
+            "That link couldn't be resolved -- check it's a valid OneDrive/SharePoint sharing link."
+        )
+    _raise_for_response(resp, "resolving the shared link")
+
+    item = resp.json()
+    if "folder" not in item:
+        raise OneDriveConnectionError("That link points to a file, not a folder. Paste a link to a folder.")
+    return item  # has id, parentReference.driveId, name, webUrl, folder{...}
+
+
+def _list_children(access_token: str, drive_id: str, item_id: str) -> list[dict]:
+    children: list[dict] = []
+    url = (
+        f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"
+        "?$select=id,name,size,file,folder"
+    )
+    while url:
+        resp = requests.get(url, headers=_headers(access_token), timeout=30)
+        _raise_for_response(resp, "listing folder contents")
+        body = resp.json()
+        children.extend(body.get("value", []))
+        url = body.get("@odata.nextLink")
+    return children
+
+
+def _extension(name: str) -> str:
+    if "." not in name:
+        return ""
+    return "." + name.rsplit(".", 1)[-1].lower()
+
+
+def list_target_files(
+    access_token: str, drive_id: str, item_id: str, base_path: str
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """
+    Recursively walks the folder (Graph has no single-call recursive
+    listing the way GitHub's tree API does, so this queues and walks
+    subfolders one Graph call at a time). Returns (target_files, skipped)
+    where target_files is [{"item_id", "path", "size"}, ...] for every
+    supported, within-size-cap file, and skipped is [(path, reason), ...]
+    for everything else (wrong extension, too large). base_path is
+    prefixed onto every entry purely for a readable filename/SourcePath.
+    """
+    target_files: list[dict] = []
+    skipped: list[tuple[str, str]] = []
+    stack = [(item_id, base_path)]
+
+    while stack:
+        current_id, current_path = stack.pop()
+        for child in _list_children(access_token, drive_id, current_id):
+            name = child["name"]
+            child_path = f"{current_path}/{name}" if current_path else name
+
+            if "folder" in child:
+                stack.append((child["id"], child_path))
+                continue
+            if "file" not in child:
+                continue  # some other item type (package, etc.) -- skip silently
+
+            size = child.get("size", 0)
+            ext = _extension(name)
+            if ext not in SUPPORTED_EXTENSIONS:
+                skipped.append((child_path, "unsupported file type"))
+                continue
+            if size > _MAX_BYTES:
+                skipped.append((child_path, f"exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit"))
+                continue
+
+            target_files.append({"item_id": child["id"], "path": child_path, "size": size})
+
+    return target_files, skipped
+
+
+def fetch_file_content(access_token: str, drive_id: str, item_id: str) -> bytes:
+    url = f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content"
+    resp = requests.get(url, headers=_headers(access_token), timeout=60)
+    _raise_for_response(resp, "downloading a file")
+    return resp.content

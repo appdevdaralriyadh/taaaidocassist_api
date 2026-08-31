@@ -5,7 +5,9 @@ DarAI_Users / DarAI_ChatHistory map exactly to spec §4's DDL (Phase 1).
 DarAI_Documents / DarAI_DocumentChunks (Phase 2) map to that same DDL plus
 one additive column -- ContentHash on DarAI_Documents, added by
 backend/sql/002_add_document_content_hash.sql -- used for duplicate-upload
-detection. Nothing else deviates from the spec's schema.
+detection. DarAI_SourceConnections (final phase) is a new table, added by
+backend/sql/003_create_source_connections.sql, for OneDrive/GitHub
+connectors. Nothing else deviates from the spec's schema.
 """
 
 import uuid
@@ -86,3 +88,25 @@ class DocumentChunk(Base):
     CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
 
     document = relationship("Document", back_populates="chunks")
+
+
+class SourceConnection(Base):
+    __tablename__ = "DarAI_SourceConnections"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    SourceType = Column(Unicode(20), nullable=False)  # 'onedrive' | 'github'
+    DisplayLabel = Column(Unicode(255), nullable=False)
+    # owner/repo/ref/path (github) or drive_id/item_id/path (onedrive) --
+    # a JSON blob rather than more columns, since the two source types'
+    # config shapes don't overlap.
+    ConfigJson = Column(UnicodeText, nullable=False)
+    # GitHub PAT only -- always NULL for onedrive (see
+    # backend/sql/003_create_source_connections.sql for why).
+    Secret = Column(UnicodeText, nullable=True)
+    CreatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=False)
+    CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    LastSyncedAt = Column(DateTime, nullable=True)
+    LastSyncStatus = Column(Unicode(20), nullable=True)  # 'success' | 'partial' | 'error'
+    LastSyncError = Column(UnicodeText, nullable=True)
+
+    creator = relationship("User")

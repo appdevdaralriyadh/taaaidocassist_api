@@ -1,12 +1,20 @@
 """
-Orchestrates ingesting one uploaded file end-to-end: hash -> parse ->
-chunk -> embed -> persist (spec §3.2). Always additive -- an ingestion
-call only ever adds a new Document + its DocumentChunk rows, and never
-touches any existing ones, duplicate or not (per your choice: duplicates
-are allowed through, just flagged).
+Orchestrates ingesting one file end-to-end: hash -> parse -> chunk ->
+embed -> persist (spec §3.2). Always additive -- an ingestion call only
+ever adds a new Document + its DocumentChunk rows, and never touches any
+existing ones, duplicate or not (per your choice: duplicates are allowed
+through, just flagged).
+
+Shared by local upload (app/api/routes/documents.py, source_type defaults
+to "upload") and the OneDrive/GitHub connectors (app/api/routes/sources.py,
+which pass source_type="onedrive"/"github" and the file's path within that
+source) -- one pipeline, so a document behaves identically (same chunking,
+same embedding, same dedupe-by-hash flagging) no matter which source it
+came from.
 """
 
 import hashlib
+from typing import Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -25,12 +33,21 @@ class IngestionResult:
 
 
 def ingest_upload(
-    *, db: Session, filename: str, content: bytes, uploaded_by: User
+    *,
+    db: Session,
+    filename: str,
+    content: bytes,
+    uploaded_by: User,
+    source_type: str = "upload",
+    source_path: Optional[str] = None,
 ) -> IngestionResult:
     content_hash = hashlib.sha256(content).digest()
 
     # Flag only -- per spec §7 this is "dedupe by content hash or warn",
-    # and you chose warn: an existing match doesn't stop ingestion.
+    # and you chose warn: an existing match doesn't stop ingestion. Dedupe
+    # is by content hash only, so the same file arriving via a different
+    # source_type (e.g. uploaded locally, then also pulled from GitHub)
+    # still gets flagged.
     is_duplicate = (
         db.query(Document).filter(Document.ContentHash == content_hash).first()
         is not None
@@ -50,8 +67,8 @@ def ingest_upload(
     vectors = embed_texts(chunks)
 
     document = Document(
-        SourceType="upload",
-        SourcePath=None,
+        SourceType=source_type,
+        SourcePath=source_path,
         FileName=filename,
         UploadedBy=uploaded_by.Id,
         ContentHash=content_hash,

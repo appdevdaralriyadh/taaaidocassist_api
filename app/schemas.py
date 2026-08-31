@@ -1,8 +1,9 @@
 """
 Pydantic request/response models for the Phase 1 (auth + basic chat),
 Phase 2 (document upload + library), Phase 3 (retrieval + query routing),
-and Phase 5 (data management -- clear knowledge base / clear chat
-history, spec §3.6) endpoints.
+Phase 5 (data management -- clear knowledge base / clear chat history,
+spec §3.6), and the final phase (OneDrive/GitHub connectors, spec §3.2)
+endpoints.
 """
 
 import uuid
@@ -98,3 +99,53 @@ class ClearChatHistoryRequest(BaseModel):
 class ClearChatHistoryResponse(BaseModel):
     messages_deleted: int
     cleared_user_ids: list[int]
+
+
+class GithubConnectRequest(BaseModel):
+    pat: str  # Personal Access Token, repo-read scope
+    path: str  # pasted GitHub URL or 'owner/repo[/path]' shorthand
+    display_label: Optional[str] = None
+
+
+class OneDriveConnectRequest(BaseModel):
+    access_token: str  # short-lived Microsoft Graph token from the frontend's MSAL session
+    shared_link: str  # pasted OneDrive/SharePoint shared-folder link
+    display_label: Optional[str] = None
+
+
+class SyncRequest(BaseModel):
+    # Required when syncing a onedrive connection (a fresh Graph token,
+    # re-acquired by the frontend right before the call); ignored for
+    # github connections, which sync with the stored PAT.
+    access_token: Optional[str] = None
+
+
+class SyncFileResult(BaseModel):
+    path: str
+    status: str  # 'added' | 'duplicate' | 'skipped' | 'failed'
+    detail: Optional[str] = None
+
+
+class SyncResponse(BaseModel):
+    connection_id: int
+    files_added: int
+    files_duplicate: int
+    files_skipped: int
+    files_failed: int
+    details: list[SyncFileResult] = Field(default_factory=list)
+
+
+class SourceConnectionItem(BaseModel):
+    id: int
+    source_type: str
+    display_label: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    last_synced_at: Optional[datetime] = None
+    last_sync_status: Optional[str] = None
+    last_sync_error: Optional[str] = None
+
+
+class ConnectResponse(BaseModel):
+    connection: SourceConnectionItem
+    sync: SyncResponse
