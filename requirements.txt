@@ -20,7 +20,8 @@ pandas>=2.2
 
 # --- Embeddings + similarity search ---
 numpy>=1.26
-voyageai>=0.2          # or swap for your chosen embedding provider's SDK
+sentence-transformers>=3.0        # local embeddings (no API key) -- see app/services/embeddings.py
+langchain-text-splitters>=0.3     # chunking (RecursiveCharacterTextSplitter)
 
 # --- Anthropic Claude API ---
 anthropic>=0.34

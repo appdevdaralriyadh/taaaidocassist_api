@@ -1,6 +1,6 @@
 """
-Pydantic request/response models for the Phase 1 endpoints (auth + basic
-chat).
+Pydantic request/response models for the Phase 1 (auth + basic chat) and
+Phase 2 (document upload + library) endpoints.
 """
 
 import uuid
@@ -39,3 +39,19 @@ class ChatHistoryItem(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DocumentUploadResponse(BaseModel):
+    id: int
+    filename: str
+    chunk_count: int
+    is_duplicate: bool  # flagged, never blocked -- see spec §7
+
+
+class DocumentListItem(BaseModel):
+    id: int
+    filename: str
+    source_type: str
+    uploaded_by: Optional[str] = None
+    uploaded_at: datetime
+    chunk_count: int

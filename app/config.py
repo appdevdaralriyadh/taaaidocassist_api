@@ -7,8 +7,8 @@ pre-built connection string, and never hardcoded here.
 
 Entra ID / JWT / Anthropic settings work the same way: all environment
 variables. The ones below default to placeholder values so the app can
-still start up -- login and chat simply won't work until you replace them
-in .env with real values (see the comments in .env).
+still start up -- the relevant feature simply won't work until you
+replace them in .env with real values (see the comments in .env).
 
 load_dotenv() is called with no arguments, so it uses its default search
 behavior starting from the current working directory. The backend is
@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     # --- Anthropic Claude API (chat generation) ---
     ANTHROPIC_API_KEY: str = "REPLACE_WITH_ANTHROPIC_API_KEY"
     ANTHROPIC_MODEL: str = "claude-sonnet-4-5"
+
+    # --- Embeddings (Phase 2, spec §3.2/§3.3) ---
+    # Local sentence-transformers model -- no API key needed. Anthropic
+    # doesn't offer its own embeddings API (their docs point to Voyage AI
+    # as the recommended hosted option); this avoids a second vendor key
+    # entirely by running the model on this machine instead. First run
+    # downloads it (~90MB) from Hugging Face.
+    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # --- Upload limits (Phase 2, spec §7) ---
+    MAX_UPLOAD_SIZE_MB: int = 25
 
 
 settings = Settings()
