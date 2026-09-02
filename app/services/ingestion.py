@@ -6,11 +6,11 @@ existing ones, duplicate or not (per your choice: duplicates are allowed
 through, just flagged).
 
 Shared by local upload (app/api/routes/documents.py, source_type defaults
-to "upload") and the OneDrive/GitHub connectors (app/api/routes/sources.py,
-which pass source_type="onedrive"/"github" and the file's path within that
-source) -- one pipeline, so a document behaves identically (same chunking,
-same embedding, same dedupe-by-hash flagging) no matter which source it
-came from.
+to "upload") and the OneDrive/Google Drive connectors
+(app/api/routes/sources.py, which pass source_type="onedrive"/"googledrive"
+and the file's path within that source) -- one pipeline, so a document
+behaves identically (same chunking, same embedding, same dedupe-by-hash
+flagging) no matter which source it came from.
 """
 
 import hashlib
@@ -46,8 +46,8 @@ def ingest_upload(
     # Flag only -- per spec §7 this is "dedupe by content hash or warn",
     # and you chose warn: an existing match doesn't stop ingestion. Dedupe
     # is by content hash only, so the same file arriving via a different
-    # source_type (e.g. uploaded locally, then also pulled from GitHub)
-    # still gets flagged.
+    # source_type (e.g. uploaded locally, then also pulled from Google
+    # Drive) still gets flagged.
     is_duplicate = (
         db.query(Document).filter(Document.ContentHash == content_hash).first()
         is not None

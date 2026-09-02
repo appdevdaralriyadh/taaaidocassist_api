@@ -26,11 +26,10 @@ langchain-text-splitters>=0.3     # chunking (RecursiveCharacterTextSplitter)
 # --- Anthropic Claude API ---
 anthropic>=0.34
 
-# --- OneDrive / Microsoft Graph ---
+# --- OneDrive / Microsoft Graph / Google Drive ---
+# Both connectors authenticate with a frontend-supplied access token and
+# talk to their REST APIs directly -- no provider SDK needed for either.
 requests>=2.31
-
-# --- GitHub connector ---
-PyGithub>=2.3
 
 # --- Config / environment ---
 python-dotenv>=1.0

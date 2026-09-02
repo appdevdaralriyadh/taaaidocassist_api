@@ -1,1 +1,23 @@
 2026-09-02 06:47:24.403: INFO:     127.0.0.1:54486 - "GET /api/health HTTP/1.1" 200 OK
+2026-09-02 06:48:18.557: INFO:     127.0.0.1:54541 - "OPTIONS /api/auth/login HTTP/1.1" 200 OK
+2026-09-02 06:48:19.312: INFO:     127.0.0.1:54541 - "POST /api/auth/login HTTP/1.1" 200 OK
+2026-09-02 06:48:25.155: INFO:     127.0.0.1:54543 - "OPTIONS /api/chat/message HTTP/1.1" 200 OK
+2026-09-02 06:48:49.727: INFO:     127.0.0.1:54543 - "POST /api/chat/message HTTP/1.1" 200 OK
+2026-09-02 06:49:06.333: INFO:     127.0.0.1:54582 - "POST /api/chat/message HTTP/1.1" 200 OK
+2026-09-02 06:49:29.858: INFO:     127.0.0.1:54584 - "OPTIONS /api/documents HTTP/1.1" 200 OK
+2026-09-02 06:49:29.873: INFO:     127.0.0.1:54584 - "GET /api/documents HTTP/1.1" 200 OK
+2026-09-02 06:49:31.750: INFO:     127.0.0.1:54584 - "OPTIONS /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 06:49:31.762: INFO:     127.0.0.1:54584 - "GET /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 06:49:34.228: INFO:     127.0.0.1:54584 - "GET /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 07:14:55.223: INFO:     127.0.0.1:55052 - "OPTIONS /api/sources/googledrive/service-account-email HTTP/1.1" 200 OK
+2026-09-02 07:14:55.223: INFO:     127.0.0.1:55053 - "OPTIONS /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 07:14:55.224: INFO:     127.0.0.1:55053 - "GET /api/sources/googledrive/service-account-email HTTP/1.1" 404 Not Found
+2026-09-02 07:14:55.231: INFO:     127.0.0.1:55052 - "GET /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 08:13:27.155: INFO:     127.0.0.1:55886 - "OPTIONS /api/sources/googledrive/connect HTTP/1.1" 200 OK
+2026-09-02 08:13:27.157: INFO:     127.0.0.1:55886 - "POST /api/sources/googledrive/connect HTTP/1.1" 404 Not Found
+2026-09-02 08:13:30.978: INFO:     127.0.0.1:55886 - "OPTIONS /api/sources/googledrive/service-account-email HTTP/1.1" 200 OK
+2026-09-02 08:13:30.978: INFO:     127.0.0.1:55887 - "OPTIONS /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 08:13:30.979: INFO:     127.0.0.1:55887 - "GET /api/sources/googledrive/service-account-email HTTP/1.1" 404 Not Found
+2026-09-02 08:13:30.988: INFO:     127.0.0.1:55886 - "GET /api/sources/connections HTTP/1.1" 200 OK
+2026-09-02 08:13:41.902: INFO:     127.0.0.1:55902 - "POST /api/sources/googledrive/connect HTTP/1.1" 404 Not Found
+2026-09-02 08:13:55.624: INFO:     127.0.0.1:55903 - "POST /api/sources/googledrive/connect HTTP/1.1" 404 Not Found

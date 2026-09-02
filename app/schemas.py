@@ -2,8 +2,8 @@
 Pydantic request/response models for the Phase 1 (auth + basic chat),
 Phase 2 (document upload + library), Phase 3 (retrieval + query routing),
 Phase 5 (data management -- clear knowledge base / clear chat history,
-spec §3.6), and the final phase (OneDrive/GitHub connectors, spec §3.2)
-endpoints.
+spec §3.6), and the final phase (OneDrive/Google Drive connectors, spec
+§3.2) endpoints.
 """
 
 import uuid
@@ -101,9 +101,14 @@ class ClearChatHistoryResponse(BaseModel):
     cleared_user_ids: list[int]
 
 
-class GithubConnectRequest(BaseModel):
-    pat: str  # Personal Access Token, repo-read scope
-    path: str  # pasted GitHub URL or 'owner/repo[/path]' shorthand
+class GoogleDriveConnectRequest(BaseModel):
+    # Short-lived Google OAuth token, acquired in the browser via Google
+    # Identity Services right before this call (see
+    # googledrive.component.ts) -- never persisted server-side, same
+    # pattern OneDriveConnectRequest.access_token already uses for
+    # Microsoft Graph.
+    access_token: str
+    folder_path: str  # pasted Google Drive folder link, or a bare folder ID
     display_label: Optional[str] = None
 
 
@@ -114,9 +119,12 @@ class OneDriveConnectRequest(BaseModel):
 
 
 class SyncRequest(BaseModel):
-    # Required when syncing a onedrive connection (a fresh Graph token,
-    # re-acquired by the frontend right before the call); ignored for
-    # github connections, which sync with the stored PAT.
+    # Required for both onedrive and googledrive connections -- a fresh
+    # token, re-acquired by the frontend right before the call, for
+    # whichever provider the connection belongs to. Optional at the
+    # schema level only because this one request type is shared between
+    # source types; app/api/routes/sources.py enforces it's actually
+    # present for both.
     access_token: Optional[str] = None
 
 

@@ -1,24 +1,29 @@
 """
-OneDrive / GitHub connectors (spec §3.2, §7, §8 item 4 -- the final
-phase). Both connect flows are "paste a path/link, connect, and it reads
-+ ingests immediately" -- no repo dropdown, no folder-browsing UI. Every
-connection can be re-synced later via POST /connections/{id}/sync (spec
-§7: manual, on demand -- no background scheduler).
+OneDrive / Google Drive connectors (spec §3.2, §7, §8 item 4 -- the final
+phase; Google Drive replaces the connector originally built for GitHub).
+Both connect flows are "paste a path/link, connect, and it reads +
+ingests immediately" -- no folder-browsing UI. Every connection can be
+re-synced later via POST /connections/{id}/sync (spec §7: manual, on
+demand -- no background scheduler).
 
-GitHub persists its Personal Access Token (DarAI_SourceConnections.Secret)
-so a later sync doesn't require re-pasting it. OneDrive persists only the
-resolved folder reference, never a token: the Entra app registration used
-for login is a SPA (public client) and cannot refresh a Microsoft Graph
-token server-side without a client secret, so the frontend supplies a
-fresh, short-lived Graph token on every OneDrive call instead (see
-app/services/onedrive_source.py's docstring).
+Neither connector persists anything auth-related server-side
+(DarAI_SourceConnections.Secret stays NULL for both source types) -- both
+authenticate as whichever person is using the app, via a short-lived
+access token the frontend acquires in-browser right before each call and
+sends along with the request (OneDrive via MSAL against Microsoft Graph,
+Google Drive via Google Identity Services against the Drive API -- see
+app/services/onedrive_source.py's and app/services/googledrive_source.py's
+docstrings). Practical effect for Google Drive: a person can only pull in
+files their own Google account can actually see, and if their browser's
+Google session lapses, the next call fails with a clear "sign in again"
+error rather than silently using someone else's access.
 
 Both connect and sync reuse app/services/ingestion.py's ingest_upload()
 per file -- the same parse/chunk/embed/store/dedupe pipeline as a local
-upload, just with source_type set to "onedrive"/"github" and source_path
-set to the file's path within that source. One bad file (parse failure,
-transient network error) is recorded and skipped rather than aborting the
-whole sync.
+upload, just with source_type set to "onedrive"/"googledrive" and
+source_path set to the file's path within that source. One bad file
+(parse failure, transient network error) is recorded and skipped rather
+than aborting the whole sync.
 """
 
 import json
@@ -33,14 +38,14 @@ from app.db.models import SourceConnection, User
 from app.db.session import get_db
 from app.schemas import (
     ConnectResponse,
-    GithubConnectRequest,
+    GoogleDriveConnectRequest,
     OneDriveConnectRequest,
     SourceConnectionItem,
     SyncFileResult,
     SyncRequest,
     SyncResponse,
 )
-from app.services import github_source, onedrive_source
+from app.services import googledrive_source, onedrive_source
 from app.services.ingestion import ingest_upload
 
 router = APIRouter()
@@ -146,50 +151,45 @@ def list_connections(
     return [_to_item(connection, display_name) for connection, display_name in rows]
 
 
-@router.post("/github/connect", response_model=ConnectResponse)
-def connect_github(
-    payload: GithubConnectRequest,
+@router.post("/googledrive/connect", response_model=ConnectResponse)
+def connect_googledrive(
+    payload: GoogleDriveConnectRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     try:
-        ref = github_source.parse_github_path(payload.path)
-    except github_source.GithubPathError as exc:
+        folder_id = googledrive_source.parse_drive_path(payload.folder_path)
+    except googledrive_source.GoogleDrivePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     try:
-        repo, branch, target_files, skipped = github_source.list_target_files(payload.pat, ref)
-    except github_source.GithubConnectionError as exc:
+        folder = googledrive_source.resolve_folder(payload.access_token, folder_id)
+        target_files, skipped = googledrive_source.list_target_files(
+            payload.access_token, folder_id, folder.get("name", "")
+        )
+    except googledrive_source.GoogleDriveConnectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    label = payload.display_label or (
-        f"{ref.owner}/{ref.repo}" + (f"/{ref.path}" if ref.path else "")
-    )
-    config = {
-        "owner": ref.owner,
-        "repo": ref.repo,
-        "ref": branch,
-        "path": ref.path,
-        "single_file": ref.single_file,
-    }
+    label = payload.display_label or folder.get("name") or "Google Drive folder"
+    config = {"folder_id": folder_id, "path": folder.get("name", "")}
     connection = SourceConnection(
-        SourceType="github",
+        SourceType="googledrive",
         DisplayLabel=label,
         ConfigJson=json.dumps(config),
-        Secret=payload.pat,
+        Secret=None,
         CreatedBy=user.Id,
     )
     db.add(connection)
     db.flush()  # assigns connection.Id without ending the transaction
 
     def _fetch(entry: dict) -> bytes:
-        return github_source.fetch_file_content(repo, entry["path"], branch)
+        return googledrive_source.fetch_file_content(payload.access_token, entry)
 
     sync_result = _sync_and_record(
         db,
         connection=connection,
         uploaded_by=user,
-        source_type="github",
+        source_type="googledrive",
         target_files=target_files,
         skipped=skipped,
         fetch_fn=_fetch,
@@ -265,19 +265,17 @@ def sync_connection(
 
     config = json.loads(connection.ConfigJson)
 
-    if connection.SourceType == "github":
-        ref = github_source.GithubPathRef(
-            owner=config["owner"],
-            repo=config["repo"],
-            ref=config["ref"],
-            path=config["path"],
-            single_file=config.get("single_file", False),
-        )
-        try:
-            repo, branch, target_files, skipped = github_source.list_target_files(
-                connection.Secret, ref
+    if connection.SourceType == "googledrive":
+        if not payload.access_token:
+            raise HTTPException(
+                status_code=400,
+                detail="access_token is required to sync a Google Drive connection.",
             )
-        except github_source.GithubConnectionError as exc:
+        try:
+            target_files, skipped = googledrive_source.list_target_files(
+                payload.access_token, config["folder_id"], config["path"]
+            )
+        except googledrive_source.GoogleDriveConnectionError as exc:
             connection.LastSyncedAt = datetime.utcnow()
             connection.LastSyncStatus = "error"
             connection.LastSyncError = str(exc)
@@ -285,13 +283,13 @@ def sync_connection(
             raise HTTPException(status_code=400, detail=str(exc))
 
         def _fetch(entry: dict) -> bytes:
-            return github_source.fetch_file_content(repo, entry["path"], branch)
+            return googledrive_source.fetch_file_content(payload.access_token, entry)
 
         sync_result = _sync_and_record(
             db,
             connection=connection,
             uploaded_by=user,
-            source_type="github",
+            source_type="googledrive",
             target_files=target_files,
             skipped=skipped,
             fetch_fn=_fetch,

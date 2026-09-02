@@ -6,8 +6,10 @@ DarAI_Documents / DarAI_DocumentChunks (Phase 2) map to that same DDL plus
 one additive column -- ContentHash on DarAI_Documents, added by
 backend/sql/002_add_document_content_hash.sql -- used for duplicate-upload
 detection. DarAI_SourceConnections (final phase) is a new table, added by
-backend/sql/003_create_source_connections.sql, for OneDrive/GitHub
-connectors. Nothing else deviates from the spec's schema.
+backend/sql/003_create_source_connections.sql, for OneDrive/Google Drive
+connectors (originally OneDrive/GitHub -- GitHub was replaced by Google
+Drive; the table/column shapes didn't need to change). Nothing else
+deviates from the spec's schema.
 """
 
 import uuid
@@ -60,7 +62,7 @@ class Document(Base):
     __tablename__ = "DarAI_Documents"
 
     Id = Column(Integer, primary_key=True, autoincrement=True)
-    SourceType = Column(Unicode(20), nullable=False)  # 'upload' | 'onedrive' | 'github'
+    SourceType = Column(Unicode(20), nullable=False)  # 'upload' | 'onedrive' | 'googledrive'
     SourcePath = Column(Unicode(500))
     FileName = Column(Unicode(255), nullable=False)
     UploadedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=False)
@@ -94,14 +96,20 @@ class SourceConnection(Base):
     __tablename__ = "DarAI_SourceConnections"
 
     Id = Column(Integer, primary_key=True, autoincrement=True)
-    SourceType = Column(Unicode(20), nullable=False)  # 'onedrive' | 'github'
+    SourceType = Column(Unicode(20), nullable=False)  # 'onedrive' | 'googledrive'
     DisplayLabel = Column(Unicode(255), nullable=False)
-    # owner/repo/ref/path (github) or drive_id/item_id/path (onedrive) --
+    # drive_id/item_id/path (onedrive) or folder_id/path (googledrive) --
     # a JSON blob rather than more columns, since the two source types'
     # config shapes don't overlap.
     ConfigJson = Column(UnicodeText, nullable=False)
-    # GitHub PAT only -- always NULL for onedrive (see
-    # backend/sql/003_create_source_connections.sql for why).
+    # Always NULL for both current source types -- neither persists a
+    # per-connection secret (onedrive re-acquires a Graph token from the
+    # frontend's live MSAL session on every call; googledrive uses the
+    # one shared service-account credential in app/config.py, not
+    # anything tied to a specific connection). Column kept nullable
+    # rather than dropped, in case a future source type needs it (this
+    # column previously held GitHub's Personal Access Token before that
+    # connector was replaced by Google Drive).
     Secret = Column(UnicodeText, nullable=True)
     CreatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=False)
     CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
