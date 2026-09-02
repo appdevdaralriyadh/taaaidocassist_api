@@ -1,0 +1,4 @@
+2026-09-02 06:45:34.094: INFO:     Started server process [13396]
+2026-09-02 06:45:34.094: INFO:     Waiting for application startup.
+2026-09-02 06:45:34.094: INFO:     Application startup complete.
+2026-09-02 06:45:34.095: INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
