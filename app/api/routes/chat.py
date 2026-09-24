@@ -2,22 +2,24 @@
 Chat + retrieval-based query routing (spec §3.4, §8 build order item 3).
 
 Each message is embedded and checked against the shared knowledge base via
-app/services/retrieval.py's numpy cosine-similarity search. Clearing
-SIMILARITY_THRESHOLD *is* the routing decision -- there's no separate
+app/services/retrieval.py's SQL Server VECTOR_DISTANCE search. Clearing
+MAX_COSINE_DISTANCE *is* the routing decision -- there's no separate
 classifier call:
-  - Above threshold -> answer generated from the matched chunks, with a
-    deterministic "Source: filename" citation appended to what gets
-    persisted (never left to the model to cite reliably on its own),
-    UsedDocuments=True.
-  - Below threshold, or an empty knowledge base -> general knowledge,
+  - At or below the cutoff -> answer generated from the matched chunks,
+    with a deterministic "Source: filename" citation appended to what
+    gets persisted (never left to the model to cite reliably on its
+    own), UsedDocuments=True.
+  - Above the cutoff, or an empty knowledge base -> general knowledge,
     same behavior as Phase 1, UsedDocuments=False.
 
-Every message logs which path was taken and the top similarity score --
+Every message logs which path was taken and the best (lowest) distance --
 spec §3.4: "useful for debugging the classifier/threshold over time."
+Note this is a DISTANCE, not the old similarity score -- lower is better.
 """
 
 import logging
 import uuid
+from typing import Optional
 
 from anthropic import Anthropic
 from fastapi import APIRouter, Depends, Query
@@ -73,13 +75,13 @@ def send_message(
     used_documents = len(matches) > 0
     sources = sorted({m.filename for m in matches}) if used_documents else []
 
-    top_score = matches[0].score if matches else None
+    best_distance = matches[0].distance if matches else None
     logger.info(
-        "conversation=%s route=%s top_score=%s threshold=%.2f matched_chunks=%d",
+        "conversation=%s route=%s best_distance=%s max_distance=%.2f matched_chunks=%d",
         conversation_id,
         "knowledge_base" if used_documents else "general",
-        f"{top_score:.3f}" if top_score is not None else "n/a",
-        settings.SIMILARITY_THRESHOLD,
+        f"{best_distance:.3f}" if best_distance is not None else "n/a",
+        settings.MAX_COSINE_DISTANCE,
         len(matches),
     )
 
@@ -179,20 +181,39 @@ def get_history(
 @router.get("/debug-retrieval", response_model=DebugRetrievalResponse)
 def debug_retrieval(
     q: str = Query(..., description="Test query to run through the retrieval search"),
+    max_distance: Optional[float] = Query(
+        None,
+        description=(
+            "Override MAX_COSINE_DISTANCE for this call only -- doesn't touch the "
+            "configured value or live chat routing. This is a DISTANCE (lower is "
+            "better: 0 = identical, 2 = completely opposite), the inverse of the old "
+            "similarity score this param used to be named `threshold` for. "
+            "retrieval.search() sorts matches ascending and stops after the first one "
+            "above the cutoff, so the *real* configured value can never show you what "
+            "an above-cutoff distance actually is. Pass 2 here (the maximum possible "
+            "cosine distance) to see every chunk's true raw distance -- this is the "
+            "only way to see the actual gap between a genuine match and background "
+            "noise when recalibrating MAX_COSINE_DISTANCE after an embedding model "
+            "change."
+        ),
+    ),
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Runs the same embed + similarity search used to route live chat
-    messages, without calling Claude -- for tuning SIMILARITY_THRESHOLD /
+    Runs the same embed + vector-distance search used to route live chat
+    messages, without calling Claude -- for tuning MAX_COSINE_DISTANCE /
     TOP_K_CHUNKS against your real documents without burning API calls.
     """
-    matches = retrieval.search(db, q)
+    effective_max_distance = (
+        settings.MAX_COSINE_DISTANCE if max_distance is None else max_distance
+    )
+    matches = retrieval.search(db, q, max_distance=effective_max_distance)
     return DebugRetrievalResponse(
         query=q,
-        threshold=settings.SIMILARITY_THRESHOLD,
+        max_distance=effective_max_distance,
         matches=[
-            DebugRetrievalChunk(filename=m.filename, score=m.score, chunk_text=m.chunk_text)
+            DebugRetrievalChunk(filename=m.filename, distance=m.distance, chunk_text=m.chunk_text)
             for m in matches
         ],
     )

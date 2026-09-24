@@ -3,13 +3,32 @@ SQLAlchemy ORM models.
 
 DarAI_Users / DarAI_ChatHistory map exactly to spec §4's DDL (Phase 1).
 DarAI_Documents / DarAI_DocumentChunks (Phase 2) map to that same DDL plus
-one additive column -- ContentHash on DarAI_Documents, added by
-backend/sql/002_add_document_content_hash.sql -- used for duplicate-upload
-detection. DarAI_SourceConnections (final phase) is a new table, added by
-backend/sql/003_create_source_connections.sql, for OneDrive/Google Drive
-connectors (originally OneDrive/GitHub -- GitHub was replaced by Google
-Drive; the table/column shapes didn't need to change). Nothing else
-deviates from the spec's schema.
+two additive columns -- ContentHash on DarAI_Documents, and EmbeddingModel
+on DarAI_DocumentChunks, used by app/services/retrieval.py to detect an
+embedding-model switch even when the old and new models happen to produce
+the same vector dimension (see the comment on that column below).
+DarAI_SourceConnections (final phase) is a new table for OneDrive/Google
+Drive connectors (originally OneDrive/GitHub -- GitHub was replaced by
+Google Drive; the table/column shapes didn't need to change). Nothing
+else deviates from the spec's schema.
+
+This app now targets a separate, new SQL Server 2025 database, created
+from scratch by sql/sqlserver2025/001_create_schema.sql -- that single
+script bakes in ContentHash and EmbeddingModel from the start, so there's
+no incremental-patch lineage for this database the way
+sql/002_add_document_content_hash.sql / sql/004_add_embedding_model_to_
+chunks.sql were for the old SQL Server 2019 database. That 2019 database
+and its 002/004 patches still exist but are no longer used by this app.
+
+DocumentChunk.Embedding is deliberately NOT declared as a Column below.
+It's a native VECTOR(EMBEDDING_DIMENSIONS) column on the real table
+(app/config.py's EMBEDDING_DIMENSIONS), and SQLAlchemy has no built-in
+type for VECTOR and no way to express VECTOR_DISTANCE() in the ORM query
+builder -- so every read or write of that column goes through raw
+parameterized SQL instead (see app/services/ingestion.py and
+app/services/retrieval.py), bypassing this class entirely for that one
+column. Nothing else in the codebase touches Embedding via the ORM
+(confirmed by grep), so leaving it off this class is safe.
 """
 
 import uuid
@@ -86,7 +105,18 @@ class DocumentChunk(Base):
     DocumentId = Column(Integer, ForeignKey("DarAI_Documents.Id"), nullable=False)
     ChunkIndex = Column(Integer, nullable=False)
     ChunkText = Column(UnicodeText, nullable=False)
-    Embedding = Column(LargeBinary, nullable=False)  # VARBINARY(MAX): serialized float32 vector
+    # Embedding (VECTOR(EMBEDDING_DIMENSIONS), NOT NULL on the real table)
+    # is intentionally not mapped here -- see the module docstring above.
+    # Read/write it only via app/services/ingestion.py and
+    # app/services/retrieval.py's raw SQL.
+    #
+    # Which EMBEDDING_MODEL (app/config.py) produced that Embedding.
+    # Dimension alone can't always tell two models apart (BAAI/bge-m3 and
+    # BAAI/bge-large-en-v1.5 both output 1024-dim vectors despite being
+    # incompatible vector spaces), so app/services/retrieval.py checks
+    # this directly instead of relying on shape alone. NULL means "unknown
+    # model, exclude this chunk," never an assumed match.
+    EmbeddingModel = Column(Unicode(200), nullable=True)
     CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
 
     document = relationship("Document", back_populates="chunks")

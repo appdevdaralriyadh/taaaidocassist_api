@@ -11,17 +11,23 @@ to "upload") and the OneDrive/Google Drive connectors
 and the file's path within that source) -- one pipeline, so a document
 behaves identically (same chunking, same embedding, same dedupe-by-hash
 flagging) no matter which source it came from.
+
+Each chunk's Embedding is inserted via raw SQL, not the ORM -- see
+app/db/models.py's docstring and app/services/embeddings.py's module
+docstring for why (SQLAlchemy has no built-in VECTOR type).
 """
 
 import hashlib
 from typing import Optional
 
 from fastapi import HTTPException, status
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, DocumentChunk, User
+from app.config import settings
+from app.db.models import Document, User
 from app.services.chunking import chunk_text
-from app.services.embeddings import embed_texts, serialize_embedding
+from app.services.embeddings import embed_texts, to_vector_literal
 from app.services.parsing import extract_text
 
 
@@ -30,6 +36,34 @@ class IngestionResult:
         self.document = document
         self.chunk_count = chunk_count
         self.is_duplicate = is_duplicate
+
+
+# The dimension in CAST(... AS VECTOR(n)) has to be a literal in the SQL
+# text -- a type's size can't be a bind parameter in T-SQL -- so it's
+# interpolated here from our own settings, never from user input, which
+# is what makes that safe. Built once at import time since
+# EMBEDDING_DIMENSIONS is fixed for the life of the process (same as
+# every other setting in this app).
+#
+# CAST(:embedding AS NVARCHAR(MAX)) BEFORE casting to VECTOR, not
+# straight to VECTOR: pyodbc/ODBC Driver 17 sends a long string parameter
+# (the JSON-array embedding literal is ~20KB+) using a "long data" wire
+# type that SQL Server reports as `ntext`, and VECTOR's CAST rules
+# explicitly refuse ntext as a source type ("Explicit conversion from
+# data type ntext to vector is not allowed") even though they accept
+# nvarchar fine. ntext -> nvarchar(max) is always allowed, so this
+# intermediate cast sidesteps the restriction without needing to change
+# how pyodbc binds the parameter.
+_INSERT_CHUNK_SQL = text(
+    f"""
+    INSERT INTO dbo.DarAI_DocumentChunks
+        (DocumentId, ChunkIndex, ChunkText, Embedding, EmbeddingModel)
+    VALUES
+        (:document_id, :chunk_index, :chunk_text,
+         CAST(CAST(:embedding AS NVARCHAR(MAX)) AS VECTOR({settings.EMBEDDING_DIMENSIONS})),
+         :embedding_model)
+    """
+)
 
 
 def ingest_upload(
@@ -53,8 +87,8 @@ def ingest_upload(
         is not None
     )
 
-    text = extract_text(filename, content)
-    chunks = chunk_text(text)
+    extracted_text = extract_text(filename, content)
+    chunks = chunk_text(extracted_text)
     if not chunks:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -77,13 +111,19 @@ def ingest_upload(
     db.flush()  # assigns document.Id without ending the transaction
 
     for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
-        db.add(
-            DocumentChunk(
-                DocumentId=document.Id,
-                ChunkIndex=index,
-                ChunkText=chunk,
-                Embedding=serialize_embedding(vector),
-            )
+        db.execute(
+            _INSERT_CHUNK_SQL,
+            {
+                "document_id": document.Id,
+                "chunk_index": index,
+                "chunk_text": chunk,
+                "embedding": to_vector_literal(vector),
+                # Stamped at ingestion time so retrieval.py can detect an
+                # embedding-model switch later, even one that doesn't
+                # change the vector dimension (see app/config.py's
+                # comment on EMBEDDING_MODEL).
+                "embedding_model": settings.EMBEDDING_MODEL,
+            },
         )
 
     db.commit()

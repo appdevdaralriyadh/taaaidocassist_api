@@ -63,13 +63,17 @@ class DocumentListItem(BaseModel):
 
 class DebugRetrievalChunk(BaseModel):
     filename: str
-    score: float
+    # Cosine DISTANCE from VECTOR_DISTANCE('cosine', ...) -- LOWER is
+    # better (0 = identical, 2 = completely opposite). This is not the
+    # old similarity score; renamed from `score` specifically so it can't
+    # be misread as "higher is better" the way that field used to mean.
+    distance: float
     chunk_text: str
 
 
 class DebugRetrievalResponse(BaseModel):
     query: str
-    threshold: float
+    max_distance: float
     matches: list[DebugRetrievalChunk]
 
 
