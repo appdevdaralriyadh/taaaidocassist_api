@@ -11,22 +11,25 @@ destructive controls shared by both accounts --
     a direct API call without it is rejected too).
 
   - Clear chat history: deletes DarAI_ChatHistory rows for one or more
-    selected accounts. Either account can clear its own or the other
-    account's history (spec §3.5) -- no role check, since both accounts
-    have identical permissions (spec §3.1); the frontend's own Yes/No
-    confirmation is the gate here (no typed-confirmation requirement on
-    this endpoint).
+    selected accounts, then removes any DarAI_Conversations row left with
+    zero messages (so the Angular sidebar's conversation list actually
+    empties out too, not just the chat history view). Either account can
+    clear its own or the other account's history (spec §3.5) -- no role
+    check, since both accounts have identical permissions (spec §3.1);
+    the frontend's own Yes/No confirmation is the gate here (no
+    typed-confirmation requirement on this endpoint).
 
 Both endpoints are additive-safe in the sense that they only ever touch
-the table they say they touch: clearing history never touches
+the table(s) they say they touch: clearing history never touches
 Documents/DocumentChunks, and vice versa.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import exists
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
-from app.db.models import ChatMessage, Document, DocumentChunk, User
+from app.db.models import ChatMessage, Conversation, Document, DocumentChunk, User
 from app.db.session import get_db
 from app.schemas import (
     AccountListItem,
@@ -106,6 +109,18 @@ def clear_chat_history(
         .filter(ChatMessage.UserId.in_(requested_ids))
         .delete(synchronize_session=False)
     )
+
+    # A conversation left with zero messages after this clear is dead
+    # weight in the Angular sidebar's conversation list -- without this,
+    # "Clear chat history" removed the messages but the (now-empty)
+    # conversation kept showing up there. Scoped to "no messages remain
+    # at all", not just "none from these user_ids", so a conversation the
+    # OTHER account is still actively using (either account can post into
+    # either conversation, spec §3.5) is left alone.
+    db.query(Conversation).filter(
+        ~exists().where(ChatMessage.ConversationId == Conversation.ConversationId)
+    ).delete(synchronize_session=False)
+
     db.commit()
 
     return ClearChatHistoryResponse(

@@ -45,6 +45,29 @@ class ChatHistoryItem(BaseModel):
         from_attributes = True
 
 
+class ConversationListItem(BaseModel):
+    id: uuid.UUID
+    # "Untitled conversation" is filled in by the endpoint, never here --
+    # keeping this Optional documents that DarAI_Conversations.Title can
+    # genuinely be NULL (a conversation created but not yet titled).
+    title: Optional[str] = None
+    last_message_at: datetime
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str
+
+
+class ConversationDeleteResponse(BaseModel):
+    conversation_id: uuid.UUID
+    messages_deleted: int
+
+
+class ClearMyConversationsResponse(BaseModel):
+    conversations_deleted: int
+    messages_deleted: int
+
+
 class DocumentUploadResponse(BaseModel):
     id: int
     filename: str

@@ -9,8 +9,13 @@ embedding-model switch even when the old and new models happen to produce
 the same vector dimension (see the comment on that column below).
 DarAI_SourceConnections (final phase) is a new table for OneDrive/Google
 Drive connectors (originally OneDrive/GitHub -- GitHub was replaced by
-Google Drive; the table/column shapes didn't need to change). Nothing
-else deviates from the spec's schema.
+Google Drive; the table/column shapes didn't need to change).
+
+DarAI_Conversations is a later addition (sql/sqlserver2025/002_add_
+conversations_table.sql) backing the Angular sidebar's conversation list,
+rename, and delete features -- one row per conversation (Title,
+LastMessageAt), separate from DarAI_ChatHistory's one-row-per-message
+rows. Nothing else deviates from the spec's schema.
 
 This app now targets a separate, new SQL Server 2025 database, created
 from scratch by sql/sqlserver2025/001_create_schema.sql -- that single
@@ -75,6 +80,35 @@ class ChatMessage(Base):
     CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
 
     user = relationship("User", back_populates="chat_messages")
+
+
+class Conversation(Base):
+    """
+    One row per conversation -- metadata only (title, activity time), not
+    messages (those stay in ChatMessage/DarAI_ChatHistory, unchanged).
+
+    Created by app/api/routes/chat.py's send_message() the first time a
+    given ConversationId is used, and updated (LastMessageAt) on every
+    later message. Listing/renaming/deleting a conversation is NOT
+    restricted to the UserId that created it, matching this app's existing
+    shared-visibility design for chat history (see get_history()'s
+    comment and ClearChatHistoryRequest, which already let either account
+    act on either account's history).
+    """
+
+    __tablename__ = "DarAI_Conversations"
+
+    ConversationId = Column(Uuid, primary_key=True)
+    UserId = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=False)
+    # NULL until send_message() creates the row with a title derived from
+    # the first user message. A conversation should never actually be
+    # listed with a NULL title in practice, but the API falls back to a
+    # placeholder display string rather than assume this can't happen.
+    Title = Column(Unicode(200), nullable=True)
+    CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    LastMessageAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+
+    owner = relationship("User")
 
 
 class Document(Base):
