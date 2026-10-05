@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, chat, data_management, documents, sources
+from app.api.routes import auth, chat, data_management, documents, settings, sources
 
 app = FastAPI(title="Document Processing & Chat API")
 
@@ -21,6 +21,7 @@ app.include_router(sources.router, prefix="/api/sources", tags=["sources"])
 app.include_router(
     data_management.router, prefix="/api/data-management", tags=["data-management"]
 )
+app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
 
 @app.get("/api/health")

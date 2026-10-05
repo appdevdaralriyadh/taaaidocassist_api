@@ -22,8 +22,17 @@ version columns to DarAI_Documents (ConnectionId, ExternalId,
 SourceVersionTag, SourceModifiedAt, FileSizeBytes, Version, UpdatedAt,
 UpdatedBy) and two new tables, DarAI_IngestionJobs and
 DarAI_IngestionJobItems (one row per upload/sync run, and one per file in
-it -- used for progress and as each document's version history). Nothing
-else deviates from the spec's schema.
+it -- used for progress and as an event log).
+
+sql/sqlserver2025/004_versions_archive_settings.sql adds the soft-delete
+flag on DarAI_Documents (Status 'Active' | 'Deleted' | 'Permanently
+deleted' -- document rows are never removed by the app), plus
+DarAI_DocumentVersions (one row per version: 'Latest' | 'Previous
+version' | 'Deleted' | 'Permanently deleted'), DarAI_DocumentChunkArchive
+(chunks of non-Latest versions, embeddings kept, never read by the chat),
+DarAI_DocumentMatchExclusions ("different documents, never merge") and
+DarAI_AppSettings / DarAI_AppSettingChanges (settings edited in the app).
+Nothing else deviates from the spec's schema.
 
 This app now targets a separate, new SQL Server 2025 database, created
 from scratch by sql/sqlserver2025/001_create_schema.sql -- that single
@@ -54,6 +63,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     LargeBinary,
+    Numeric,
     Unicode,
     UnicodeText,
     Uuid,
@@ -159,14 +169,33 @@ class Document(Base):
     UpdatedAt = Column(DateTime, nullable=True, server_default=func.sysutcdatetime())
     UpdatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
 
-    # Two foreign keys to DarAI_Users now exist on this table (UploadedBy,
-    # UpdatedBy), so each relationship must say which one it follows --
-    # without foreign_keys=..., SQLAlchemy refuses to configure the mapper.
+    # --- 004_versions_archive_settings.sql additions ----------------------
+    # Soft delete: the app never removes a document row, it sets this flag.
+    # 'Active' | 'Deleted' (restorable, chunks archived) | 'Permanently deleted'
+    Status = Column(Unicode(30), nullable=False, server_default=text("'Active'"))
+    DeletedAt = Column(DateTime, nullable=True)
+    DeletedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+    DeletedReason = Column(Unicode(500), nullable=True)
+    # Set when the automatic version matching merged this document into
+    # another (it went to Deleted as an older version of that one).
+    # Restoring it marks the pair "different documents, never merge".
+    MergedIntoDocumentId = Column(Integer, nullable=True)
+
+    # Several foreign keys to DarAI_Users exist on this table (UploadedBy,
+    # UpdatedBy, DeletedBy), so each relationship must say which one it
+    # follows -- without foreign_keys=..., SQLAlchemy refuses to configure
+    # the mapper.
     uploader = relationship("User", foreign_keys=[UploadedBy])
     updater = relationship("User", foreign_keys=[UpdatedBy])
+    deleter = relationship("User", foreign_keys=[DeletedBy])
     connection = relationship("SourceConnection")
     chunks = relationship(
         "DocumentChunk", back_populates="document", cascade="all, delete-orphan"
+    )
+    # passive_deletes: the database itself cascades version rows (and their
+    # archived chunks) when a document row is removed (Clear knowledge base).
+    versions = relationship(
+        "DocumentVersion", back_populates="document", passive_deletes=True
     )
 
 
@@ -299,3 +328,121 @@ class IngestionJobItem(Base):
     UpdatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
 
     job = relationship("IngestionJob", back_populates="items")
+
+
+class DocumentVersion(Base):
+    """
+    One version of a document (004_versions_archive_settings.sql).
+
+    Status, in plain words:
+      'Latest'              -- the version the assistant answers from (its
+                               chunks are in DarAI_DocumentChunks)
+      'Previous version'    -- replaced by a newer one; restorable (chunks in
+                               DarAI_DocumentChunkArchive)
+      'Deleted'             -- the document was deleted; restorable (chunks
+                               in the archive)
+      'Permanently deleted' -- archived chunks removed; only this record stays
+
+    StatusChangedAt starts the retention countdown for 'Previous version' /
+    'Deleted' (Settings > History and retention, 30 days by default).
+    """
+
+    __tablename__ = "DarAI_DocumentVersions"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    DocumentId = Column(
+        Integer, ForeignKey("DarAI_Documents.Id", ondelete="CASCADE"), nullable=False
+    )
+    VersionNumber = Column(Integer, nullable=False)
+    FileName = Column(Unicode(255), nullable=False)
+    ContentHash = Column(LargeBinary(32), nullable=True)
+    FileSizeBytes = Column(BigInteger, nullable=True)
+    ChunkCount = Column(Integer, nullable=True)
+    Status = Column(Unicode(30), nullable=False)
+    StatusChangedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    StatusChangedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+    StoredAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    StoredBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+    # 'First upload' | 'Same file name' | 'Same name and wording' |
+    # 'Same wording' | 'Restored' | 'Merged older copy' |
+    # 'Restored as separate document'
+    HowAdded = Column(Unicode(50), nullable=True)
+    MatchScore = Column(Numeric(5, 4), nullable=True)  # wording similarity 0-1
+    RestoredFromVersionId = Column(Integer, nullable=True)
+    Note = Column(Unicode(1000), nullable=True)
+
+    document = relationship("Document", back_populates="versions")
+    storer = relationship("User", foreign_keys=[StoredBy])
+    status_changer = relationship("User", foreign_keys=[StatusChangedBy])
+
+
+class DocumentChunkArchive(Base):
+    """
+    Chunks of 'Previous version' / 'Deleted' versions. Same shape as
+    DarAI_DocumentChunks, embeddings included, so restoring a version moves
+    its chunks back without re-embedding. The chat never reads this table.
+
+    Like DocumentChunk.Embedding, this table's Embedding (VECTOR) column is
+    deliberately not mapped -- moving rows between the two tables is done
+    with raw INSERT ... SELECT, which keeps the vectors inside SQL Server.
+    DocumentId is a plain column (no foreign key -- see the SQL script).
+    """
+
+    __tablename__ = "DarAI_DocumentChunkArchive"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    VersionId = Column(
+        Integer, ForeignKey("DarAI_DocumentVersions.Id", ondelete="CASCADE"), nullable=False
+    )
+    DocumentId = Column(Integer, nullable=False)
+    ChunkIndex = Column(Integer, nullable=False)
+    ChunkText = Column(UnicodeText, nullable=False)
+    EmbeddingModel = Column(Unicode(200), nullable=True)
+    ChunkCreatedAt = Column(DateTime, nullable=True)
+    ArchivedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+
+
+class DocumentMatchExclusion(Base):
+    """
+    A pair of documents marked "different documents, never merge" -- set
+    when a document that was wrongly merged into another is restored as a
+    separate document, so the automatic version matching never joins them
+    again. Stored with the smaller Id first (one row per pair).
+    """
+
+    __tablename__ = "DarAI_DocumentMatchExclusions"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    DocumentIdA = Column(Integer, ForeignKey("DarAI_Documents.Id"), nullable=False)
+    DocumentIdB = Column(Integer, ForeignKey("DarAI_Documents.Id"), nullable=False)
+    Reason = Column(Unicode(500), nullable=True)
+    CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    CreatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+
+
+class AppSetting(Base):
+    """
+    A setting edited in the app's Settings page. Keys match the setting
+    names in app/config.py; a setting with no row here uses its config.py
+    default, so "Reset to defaults" simply deletes the row.
+    """
+
+    __tablename__ = "DarAI_AppSettings"
+
+    SettingKey = Column(Unicode(100), primary_key=True)
+    SettingValue = Column(Unicode(400), nullable=False)
+    UpdatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    UpdatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+
+
+class AppSettingChange(Base):
+    """Who changed which setting, from what, to what (NULL = the default), and when."""
+
+    __tablename__ = "DarAI_AppSettingChanges"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    SettingKey = Column(Unicode(100), nullable=False)
+    OldValue = Column(Unicode(400), nullable=True)
+    NewValue = Column(Unicode(400), nullable=True)
+    ChangedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    ChangedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)

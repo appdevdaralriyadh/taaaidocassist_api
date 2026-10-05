@@ -2,7 +2,8 @@
 Data management (spec §3.6, §8 build order item 5): equal-permission,
 destructive controls shared by both accounts --
 
-  - Clear knowledge base: wipes every DarAI_DocumentChunks row, then every
+  - Clear knowledge base: wipes every DarAI_DocumentChunks row (plus the
+    version history, archived chunks and Deleted documents), then every
     DarAI_Documents row (child rows first -- DocumentChunks.DocumentId has
     a FOREIGN KEY REFERENCES DarAI_Documents(Id), spec §4 -- so deleting
     the parent first would violate the constraint). Requires the literal
@@ -29,7 +30,16 @@ from sqlalchemy import exists
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
-from app.db.models import ChatMessage, Conversation, Document, DocumentChunk, User
+from app.db.models import (
+    ChatMessage,
+    Conversation,
+    Document,
+    DocumentChunk,
+    DocumentChunkArchive,
+    DocumentMatchExclusion,
+    DocumentVersion,
+    User,
+)
 from app.db.session import get_db
 from app.schemas import (
     AccountListItem,
@@ -74,8 +84,20 @@ def clear_knowledge_base(
     # Child rows first: DarAI_DocumentChunks.DocumentId is a FOREIGN KEY
     # REFERENCES DarAI_Documents(Id) (spec §4) with no ON DELETE CASCADE
     # specified, so deleting Documents first would fail the constraint.
+    # Everything document-related goes, including Deleted documents and
+    # version history (004_versions_archive_settings.sql): "never merge"
+    # pairs first (their FKs to Documents have no cascade), then archived
+    # chunks and version rows, then the documents themselves. Counts are
+    # for the knowledge base proper (live chunks, and documents that were
+    # Active), as before.
+    db.query(DocumentMatchExclusion).delete(synchronize_session=False)
     chunks_deleted = db.query(DocumentChunk).delete(synchronize_session=False)
-    documents_deleted = db.query(Document).delete(synchronize_session=False)
+    db.query(DocumentChunkArchive).delete(synchronize_session=False)
+    db.query(DocumentVersion).delete(synchronize_session=False)
+    documents_deleted = (
+        db.query(Document).filter(Document.Status == "Active").count()
+    )
+    db.query(Document).delete(synchronize_session=False)
     db.commit()
 
     return ClearKnowledgeBaseResponse(

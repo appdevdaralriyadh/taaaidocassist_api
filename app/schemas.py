@@ -8,7 +8,7 @@ spec §3.6), and the final phase (OneDrive/Google Drive connectors, spec
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -74,7 +74,7 @@ class DocumentUploadResponse(BaseModel):
     chunk_count: int
     # Kept for compatibility: True exactly when outcome == 'unchanged'.
     is_duplicate: bool
-    # 'new' | 'updated' | 'unchanged' | 'older_version' (see
+    # 'new' | 'updated' | 'unchanged' | 'older_version' | 'restored' (see
     # app/services/ingestion.py's ingest_local_upload)
     outcome: str
     version: int
@@ -107,12 +107,64 @@ class DocumentUploadResponse(BaseModel):
     needs_review: bool = False
     note: Optional[str] = None
     job_id: Optional[int] = None
+    # outcome == 'updated': days the replaced version stays restorable in
+    # History, and days the other removed copies stay in Deleted (0 = kept
+    # until removed by hand)
+    retention_days: Optional[int] = None
+    removed_retention_days: Optional[int] = None
+    # outcome == 'restored': a Deleted document with identical content was
+    # brought back -- under the uploaded name when renamed_from is set; and
+    # the document it had been merged into, now kept separate from it
+    renamed_from: Optional[str] = None
+    never_merge_with: Optional[str] = None
 
 
 class DocumentDeleteResponse(BaseModel):
+    # Deleting is permanent (content and every version removed); only the
+    # automatic version matching moves documents to Deleted.
     id: int
     filename: str
-    chunks_deleted: int
+    chunks_deleted: int  # live + archived chunks removed for good
+    deleted_at: Optional[datetime] = None
+    permanent: bool = True
+    was_in_deleted: bool = False  # deleted from the Deleted tab
+    # kept for compatibility: always 0 / None now
+    retention_days: int = 0
+    restorable_until: Optional[datetime] = None
+
+
+class DeletedDocumentItem(BaseModel):
+    id: int
+    filename: str
+    source_type: str
+    version: int
+    chunk_count: int
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
+    reason: Optional[str] = None
+    # set when the automatic matching merged it into another document
+    merged_into_filename: Optional[str] = None
+    restorable: bool = True
+    permanent_delete_on: Optional[datetime] = None
+
+
+class DeletedDocumentsResponse(BaseModel):
+    retention_days: int
+    items: list[DeletedDocumentItem] = Field(default_factory=list)
+
+
+class DocumentRestoreRequest(BaseModel):
+    # optional new name -- needed when an active document already has its name
+    new_name: Optional[str] = Field(default=None, max_length=255)
+
+
+class DocumentRestoreResponse(BaseModel):
+    id: int
+    filename: str
+    version: int
+    chunk_count: int
+    renamed_from: Optional[str] = None
+    never_merge_with: Optional[str] = None
 
 
 class DocumentListItem(BaseModel):
@@ -225,3 +277,149 @@ class SourceConnectionItem(BaseModel):
 class ConnectResponse(BaseModel):
     connection: SourceConnectionItem
     sync: SyncResponse
+
+
+# --- Settings page (app/api/routes/settings.py) ------------------------------
+# Values are in the units the page shows: percentages as whole numbers
+# (50 = 50%), closeness as a percentage, words/days as integers, switches as
+# true/false. bool is listed first in the Union so true/false stay booleans.
+SettingValue = Union[bool, int, float]
+
+
+class SettingItem(BaseModel):
+    key: str
+    label: str
+    help: str
+    kind: str  # 'percent' | 'closeness' | 'int' | 'bool'
+    unit: str = ""
+    min: Optional[float] = None
+    max: Optional[float] = None
+    value: SettingValue
+    default_value: SettingValue
+    is_default: bool
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    warn_below: Optional[float] = None
+    warn_text: Optional[str] = None
+
+
+class SettingSection(BaseModel):
+    key: str
+    title: str
+    description: str
+    items: list[SettingItem]
+
+
+class SettingsResponse(BaseModel):
+    sections: list[SettingSection]
+    # soft warnings after a save (e.g. a value set into a risky range)
+    warnings: list[str] = Field(default_factory=list)
+    # False when the signed-in user may view but not change settings
+    can_edit: bool = True
+
+
+class SettingsUpdateRequest(BaseModel):
+    values: dict[str, SettingValue]
+
+
+class SettingsResetRequest(BaseModel):
+    keys: Optional[list[str]] = None  # omitted/empty = reset everything
+
+
+class SettingChangeItem(BaseModel):
+    key: str
+    label: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    changed_at: datetime
+    changed_by: Optional[str] = None
+
+
+# --- History panel (Document Library) --------------------------------------
+
+
+class HistoryDocument(BaseModel):
+    id: int
+    filename: str
+    status: str
+    version: int
+    source_type: str
+
+
+class HistoryVersionItem(BaseModel):
+    id: int
+    version: int
+    filename: str
+    # 'Latest' | 'Previous version' | 'Deleted' | 'Permanently deleted'
+    status: str
+    chunk_count: Optional[int] = None
+    file_size_bytes: Optional[int] = None
+    stored_at: Optional[datetime] = None
+    stored_by: Optional[str] = None
+    status_changed_at: Optional[datetime] = None
+    status_changed_by: Optional[str] = None
+    # 'First upload' | 'Same file name' | 'Same name and wording' |
+    # 'Same wording' | 'Restored' | 'Restored as separate document'
+    how_added: Optional[str] = None
+    match_score: Optional[float] = None  # wording similarity 0-1
+    restored_from_version: Optional[int] = None
+    note: Optional[str] = None
+    restorable: bool = False
+    permanent_delete_on: Optional[datetime] = None
+    # pre-filled name for "Restore as separate document"
+    suggested_separate_name: Optional[str] = None
+
+
+class HistoryMergedCopy(BaseModel):
+    id: int
+    filename: str
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
+    permanent_delete_on: Optional[datetime] = None
+
+
+class DocumentHistoryResponse(BaseModel):
+    document: HistoryDocument
+    previous_retention_days: int
+    deleted_retention_days: int
+    versions: list[HistoryVersionItem] = Field(default_factory=list)
+    # older copies merged into this document by the automatic matching
+    # (they're in the Deleted tab and can be restored from there)
+    merged_copies: list[HistoryMergedCopy] = Field(default_factory=list)
+    # documents marked "different documents, never merge" with this one
+    never_merge_with: list[str] = Field(default_factory=list)
+
+
+class VersionRestoreResponse(BaseModel):
+    id: int
+    filename: str
+    restored_version: int
+    replaced_version: int
+    new_version: int
+    chunk_count: int
+    kept_current_name: bool = False
+    message: str
+
+
+class SeparateRestoreRequest(BaseModel):
+    new_name: str = Field(..., max_length=255)
+
+
+class SeparateRestoreResponse(BaseModel):
+    id: int
+    filename: str
+    source_filename: str
+    source_version: int
+    chunk_count: int
+    message: str
+
+
+class DocumentRenameRequest(BaseModel):
+    filename: str = Field(..., max_length=255)
+
+
+class DocumentRenameResponse(BaseModel):
+    id: int
+    filename: str
+    old_filename: str
+    changed: bool

@@ -162,6 +162,27 @@ class Settings(BaseSettings):
     # Deliberately generous -- it only decides which documents to CHECK; the
     # wording comparison above makes the actual decision.
     VERSION_CANDIDATE_MAX_DISTANCE: float = 0.15
+    # A file whose year (filename or title) is earlier than the matched stored
+    # document's is not added, so an old edition never replaces a newer one.
+    BLOCK_OLDER_EDITIONS: bool = True
+    # When on, documents whose names look like a series ("NDA Vendor A" /
+    # "NDA Vendor B") are never merged on content alone -- they're flagged
+    # for review instead. Off by default: wording that matches 80%+ both
+    # ways is the same document under another name, so the newer one
+    # replaces the older (which stays restorable in History).
+    PROTECT_SIBLING_NAMES: bool = False
+
+    # --- History and retention ---
+    # Days a deleted document / a replaced (previous) version stays
+    # restorable before it's permanently deleted. 0 = keep forever.
+    DELETED_RETENTION_DAYS: int = 30
+    PREVIOUS_VERSION_RETENTION_DAYS: int = 30
+
+    # *** Everything in this "Document versioning" block, plus the two
+    # retention settings, is a DEFAULT only: it can be changed live on the
+    # app's Settings page, which stores the changed value in
+    # DarAI_AppSettings (see app/services/app_settings.py). A setting with
+    # no row there uses the value written here. ***
 
     # --- Retrieval / query routing (Phase 3, spec §3.3/§3.4) ---
     # Cosine DISTANCE cutoff a chunk must clear before the assistant
