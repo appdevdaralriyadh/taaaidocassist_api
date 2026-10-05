@@ -175,6 +175,17 @@ class DocumentListItem(BaseModel):
     uploaded_at: datetime
     chunk_count: int
     version: int = 1
+    # 'Active' | 'Excluded' (kept in the Library, left out of the chat)
+    status: str = "Active"
+    # cloud documents: the file's path within the connected folder
+    source_path: Optional[str] = None
+
+
+class DocumentExcludeResponse(BaseModel):
+    id: int
+    filename: str
+    status: str  # 'Excluded' | 'Active'
+    chunk_count: int  # chunks parked (exclude) or brought back (include)
 
 
 class DebugRetrievalChunk(BaseModel):
@@ -250,16 +261,28 @@ class SyncRequest(BaseModel):
 
 class SyncFileResult(BaseModel):
     path: str
-    status: str  # 'added' | 'duplicate' | 'skipped' | 'failed'
+    # 'added' | 'updated' | 'renamed' | 'unchanged' | 'linked' | 'review' |
+    # 'excluded' | 'duplicate' | 'older_version' | 'removed' | 'skipped' |
+    # 'failed' (see app/services/cloud_sync.py)
+    status: str
     detail: Optional[str] = None
+    document_id: Optional[int] = None
 
 
 class SyncResponse(BaseModel):
     connection_id: int
     files_added: int
-    files_duplicate: int
+    files_duplicate: int  # identical content already in the knowledge base
     files_skipped: int
     files_failed: int
+    files_updated: int = 0  # new versions (changed in the cloud, or of a local upload)
+    files_renamed: int = 0
+    files_unchanged: int = 0
+    files_linked: int = 0  # a local upload that now follows the cloud file
+    files_review: int = 0  # added, marked REVIEW
+    files_excluded: int = 0
+    files_older: int = 0  # older editions, not added
+    files_removed: int = 0  # gone from the cloud folder -> permanently deleted
     details: list[SyncFileResult] = Field(default_factory=list)
 
 

@@ -20,7 +20,7 @@ Moving chunks is done with INSERT ... SELECT inside SQL Server, so the
 VECTOR embeddings are copied as-is and restoring is instant.
 
 Plain-word status values, used both here and in the database:
-  document: 'Active' | 'Deleted' | 'Permanently deleted'
+  document: 'Active' | 'Excluded' | 'Deleted' | 'Permanently deleted'
   version:  'Latest' | 'Previous version' | 'Deleted' | 'Permanently deleted'
 """
 
@@ -42,6 +42,10 @@ from app.db.models import (
 )
 
 DOC_ACTIVE = "Active"
+# Kept in the Library but left out of the chat (its content is parked in
+# the archive) -- e.g. a file in a synced cloud folder that shouldn't be
+# used for answers. Sync leaves it alone until it's included again.
+DOC_EXCLUDED = "Excluded"
 DOC_DELETED = "Deleted"
 DOC_PERMANENTLY_DELETED = "Permanently deleted"
 
@@ -514,7 +518,11 @@ def _restorable_version(db: Session, doc: Document, version_id: int) -> Document
     if doc.Status != DOC_ACTIVE:
         raise HTTPException(
             status_code=409,
-            detail=f"'{doc.FileName}' is in Deleted -- restore the document first.",
+            detail=(
+                f"'{doc.FileName}' is excluded from the chat -- include it first."
+                if doc.Status == DOC_EXCLUDED
+                else f"'{doc.FileName}' is in Deleted -- restore the document first."
+            ),
         )
     version = db.get(DocumentVersion, version_id)
     if version is None or version.DocumentId != doc.Id:
@@ -644,7 +652,7 @@ def restore_version_as_separate(
 
 def rename_document(db: Session, doc: Document, new_name: str, *, by_user_id: Optional[int]) -> dict:
     """Renames an active document (409 with a suggestion if the name is taken). Does not commit."""
-    if doc.Status != DOC_ACTIVE:
+    if doc.Status not in (DOC_ACTIVE, DOC_EXCLUDED):
         raise HTTPException(status_code=409, detail=f"'{doc.FileName}' is in Deleted -- restore it first.")
     name = clean_new_name(new_name, doc.FileName)
     old_name = doc.FileName
@@ -799,6 +807,10 @@ def purge_document(db: Session, doc: Document, *, by_user_id: Optional[int], rea
         if v.Status != PERMANENTLY_DELETED:
             removed += purge_version(db, v, by_user_id=by_user_id, note=reason)
     doc.Status = DOC_PERMANENTLY_DELETED
+    # Frees the cloud file's identity (unique per connection), so the same
+    # file can be synced in again later as a new document.
+    doc.ConnectionId = None
+    doc.ExternalId = None
     if doc.DeletedAt is None:
         doc.DeletedAt = func.sysutcdatetime()
     doc.DeletedBy = by_user_id
@@ -832,9 +844,56 @@ def expired_items(db: Session, *, deleted_days: int, previous_days: int, now: Op
             .join(Document, Document.Id == DocumentVersion.DocumentId)
             .filter(
                 DocumentVersion.Status == PREVIOUS,
-                Document.Status == DOC_ACTIVE,
+                Document.Status.in_((DOC_ACTIVE, DOC_EXCLUDED)),
                 DocumentVersion.StatusChangedAt <= now - timedelta(days=previous_days),
             )
             .all()
         )
     return docs, versions
+
+
+# ---------------------------------------------------------------------------
+# Exclude / include: keep a document in the Library but out of the chat
+# ---------------------------------------------------------------------------
+
+
+def exclude_document(db: Session, doc: Document, *, by_user_id: Optional[int]) -> int:
+    """
+    Parks the current content in the archive (the chat stops using it at
+    once) and flags the document 'Excluded'. Its version row stays
+    'Latest'. Returns the number of chunks parked. Does not commit.
+    """
+    if doc.Status != DOC_ACTIVE:
+        raise HTTPException(status_code=409, detail=f"'{doc.FileName}' is {doc.Status.lower()}.")
+    version = ensure_latest_version(db, doc)
+    parked = live_chunk_count(db, doc.Id)
+    params = {"version_id": version.Id, "document_id": doc.Id}
+    db.execute(ARCHIVE_CHUNKS_SQL, params)
+    db.execute(DELETE_LIVE_CHUNKS_SQL, params)
+    doc.Status = DOC_EXCLUDED
+    doc.UpdatedAt = func.sysutcdatetime()
+    doc.UpdatedBy = by_user_id
+    db.flush()
+    return parked
+
+
+def include_document(db: Session, doc: Document, *, by_user_id: Optional[int]) -> int:
+    """Brings an Excluded document back into the chat. Returns chunks restored. Does not commit."""
+    if doc.Status != DOC_EXCLUDED:
+        raise HTTPException(status_code=409, detail=f"'{doc.FileName}' isn't excluded.")
+    version = (
+        db.query(DocumentVersion)
+        .filter(DocumentVersion.DocumentId == doc.Id, DocumentVersion.Status == LATEST)
+        .order_by(DocumentVersion.Id.desc())
+        .first()
+    )
+    if version is None or archived_chunk_count(db, version.Id) == 0:
+        raise HTTPException(status_code=409, detail=f"'{doc.FileName}' has no stored content to include.")
+    params = {"version_id": version.Id, "document_id": doc.Id}
+    db.execute(RESTORE_CHUNKS_SQL, params)
+    db.execute(DELETE_ARCHIVED_CHUNKS_SQL, params)
+    doc.Status = DOC_ACTIVE
+    doc.UpdatedAt = func.sysutcdatetime()
+    doc.UpdatedBy = by_user_id
+    db.flush()
+    return live_chunk_count(db, doc.Id)

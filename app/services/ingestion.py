@@ -440,6 +440,47 @@ def _find_version_matches(
     return matches, near_miss
 
 
+def _near_miss_note(near_miss: "_NearMiss", cfg: dict) -> str:
+    """Why a look-alike was kept as a separate document (shown as REVIEW)."""
+    note = None
+    pct = _pct_range(near_miss.similarity, near_miss.similarity_max)
+    if near_miss.reason == "name":
+        note = (
+            f"The name looks like '{near_miss.document.FileName}', but only {pct} of "
+            f"the wording is the same (at least "
+            f"{round(cfg['VERSION_MATCH_MIN_SIMILARITY'] * 100)}% is needed to treat it "
+            "as a new version), so both are kept."
+        )
+    elif near_miss.reason == "sibling":
+        note = (
+            f"{pct} of the wording is the same as '{near_miss.document.FileName}', but "
+            "the names look like two different documents of the same kind (e.g. the same "
+            "template for different parties), so both are kept."
+        )
+    elif (
+        near_miss.similarity_max is not None
+        and near_miss.similarity_max >= 0.9
+        and near_miss.similarity < cfg["CONTENT_MATCH_MIN_COVERAGE"]
+    ):
+        # one document is (almost) entirely inside the other -- e.g. a
+        # handbook that includes a whole policy, or a policy that
+        # includes a whole annex
+        note = (
+            f"One of this file and '{near_miss.document.FileName}' contains most of the "
+            f"other's text ({pct} overlap), e.g. a handbook that includes a policy -- "
+            "that isn't a new version, so both are kept."
+        )
+    else:
+        note = (
+            f"{pct} of the wording is the same as '{near_miss.document.FileName}' "
+            f"(a different name needs at least "
+            f"{round(cfg['CONTENT_MATCH_MIN_SIMILARITY'] * 100)}% one way and "
+            f"{round(cfg['CONTENT_MATCH_MIN_COVERAGE'] * 100)}% the other to be replaced "
+            "automatically), so both are kept -- check whether one is an older version."
+        )
+    return note
+
+
 def _start_job(db: Session, *, user: User, filename: str, content_hash: bytes, size: int):
     job = IngestionJob(
         JobType="upload",
@@ -538,7 +579,7 @@ def ingest_local_upload(
         #    any filename) -> skip. Nothing is embedded or stored.
         identical = (
             db.query(Document)
-            .filter(Document.ContentHash == content_hash, Document.Status == doc_history.DOC_ACTIVE)
+            .filter(Document.ContentHash == content_hash, Document.Status.in_((doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED)))
             .order_by(Document.Id)
             .first()
         )
@@ -838,43 +879,7 @@ def ingest_local_upload(
 
         # 3. Brand-new document. If something looked like a version but
         #    didn't meet the rules, keep both and flag it for review.
-        note = None
-        if near_miss is not None:
-            pct = _pct_range(near_miss.similarity, near_miss.similarity_max)
-            if near_miss.reason == "name":
-                note = (
-                    f"The name looks like '{near_miss.document.FileName}', but only {pct} of "
-                    f"the wording is the same (at least "
-                    f"{round(cfg['VERSION_MATCH_MIN_SIMILARITY'] * 100)}% is needed to treat it "
-                    "as a new version), so both are kept."
-                )
-            elif near_miss.reason == "sibling":
-                note = (
-                    f"{pct} of the wording is the same as '{near_miss.document.FileName}', but "
-                    "the names look like two different documents of the same kind (e.g. the same "
-                    "template for different parties), so both are kept."
-                )
-            elif (
-                near_miss.similarity_max is not None
-                and near_miss.similarity_max >= 0.9
-                and near_miss.similarity < cfg["CONTENT_MATCH_MIN_COVERAGE"]
-            ):
-                # one document is (almost) entirely inside the other -- e.g. a
-                # handbook that includes a whole policy, or a policy that
-                # includes a whole annex
-                note = (
-                    f"One of this file and '{near_miss.document.FileName}' contains most of the "
-                    f"other's text ({pct} overlap), e.g. a handbook that includes a policy -- "
-                    "that isn't a new version, so both are kept."
-                )
-            else:
-                note = (
-                    f"{pct} of the wording is the same as '{near_miss.document.FileName}' "
-                    f"(a different name needs at least "
-                    f"{round(cfg['CONTENT_MATCH_MIN_SIMILARITY'] * 100)}% one way and "
-                    f"{round(cfg['CONTENT_MATCH_MIN_COVERAGE'] * 100)}% the other to be replaced "
-                    "automatically), so both are kept -- check whether one is an older version."
-                )
+        note = _near_miss_note(near_miss, cfg) if near_miss is not None else None
 
         document = Document(
             SourceType="upload",
@@ -1201,6 +1206,32 @@ def rename_document(db: Session, *, document_id: int, new_name: str, renamed_by:
         db.commit()
         db.refresh(document)
     return result
+
+
+def set_excluded(db: Session, *, document_id: int, excluded: bool, by_user: User) -> dict:
+    """Exclude a document from the chat, or include it again (recorded in the history)."""
+    document = _active_document(db, document_id)
+    if excluded:
+        chunks = doc_history.exclude_document(db, document, by_user_id=by_user.Id)
+        outcome, message = "excluded", f"Excluded '{document.FileName}' from the chat."
+    else:
+        chunks = doc_history.include_document(db, document, by_user_id=by_user.Id)
+        outcome, message = "included", f"Included '{document.FileName}' in the chat again."
+    _record_library_job(
+        db,
+        job_type="exclude" if excluded else "include",
+        outcome=outcome,
+        document=document,
+        by_user=by_user,
+        chunk_count=chunks,
+        message=message,
+        removed=False,
+        updated=True,
+        previous_version=document.Version,
+    )
+    db.commit()
+    db.refresh(document)
+    return {"document": document, "chunk_count": chunks}
 
 
 # ---------------------------------------------------------------------------

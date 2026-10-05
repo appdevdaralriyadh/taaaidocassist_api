@@ -32,6 +32,7 @@ from app.schemas import (
     DeletedDocumentItem,
     DeletedDocumentsResponse,
     DocumentDeleteResponse,
+    DocumentExcludeResponse,
     DocumentHistoryResponse,
     DocumentListItem,
     DocumentRenameRequest,
@@ -209,8 +210,8 @@ def list_documents(
         )
         .join(User, User.Id == Document.UploadedBy)
         .outerjoin(chunk_counts, chunk_counts.c.document_id == Document.Id)
-        # Active documents only -- Deleted ones are listed by GET /deleted
-        .filter(Document.Status == doc_history.DOC_ACTIVE)
+        # Active and Excluded documents -- Deleted ones are listed by GET /deleted
+        .filter(Document.Status.in_((doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED)))
         .order_by(Document.UploadedAt.desc())
         .all()
     )
@@ -224,6 +225,8 @@ def list_documents(
             uploaded_at=doc.UploadedAt,
             chunk_count=chunk_count,
             version=doc.Version,
+            status=doc.Status,
+            source_path=doc.SourcePath,
         )
         for doc, display_name, chunk_count in rows
     ]
@@ -315,4 +318,35 @@ def rename_document(
         filename=result["document"].FileName,
         old_filename=result["old_name"],
         changed=result["changed"],
+    )
+
+
+# --- Exclude / include -------------------------------------------------------
+
+
+@router.post("/{document_id}/exclude", response_model=DocumentExcludeResponse)
+def exclude_document(
+    document_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Keeps the document in the Library but out of the chat (sync leaves it alone)."""
+    result = ingestion.set_excluded(db, document_id=document_id, excluded=True, by_user=user)
+    doc = result["document"]
+    return DocumentExcludeResponse(
+        id=doc.Id, filename=doc.FileName, status=doc.Status, chunk_count=result["chunk_count"]
+    )
+
+
+@router.post("/{document_id}/include", response_model=DocumentExcludeResponse)
+def include_document(
+    document_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Brings an excluded document back into the chat."""
+    result = ingestion.set_excluded(db, document_id=document_id, excluded=False, by_user=user)
+    doc = result["document"]
+    return DocumentExcludeResponse(
+        id=doc.Id, filename=doc.FileName, status=doc.Status, chunk_count=result["chunk_count"]
     )

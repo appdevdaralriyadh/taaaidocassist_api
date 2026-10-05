@@ -197,7 +197,7 @@ def _list_children(access_token: str, folder_id: str) -> list[dict]:
     children: list[dict] = []
     params = {
         "q": f"'{folder_id}' in parents and trashed = false",
-        "fields": "nextPageToken, files(id,name,mimeType,size)",
+        "fields": "nextPageToken, files(id,name,mimeType,size,md5Checksum,version,modifiedTime)",
         "pageSize": 1000,
         "supportsAllDrives": "true",
         "includeItemsFromAllDrives": "true",
@@ -226,17 +226,21 @@ def _extension(name: str) -> str:
 
 def list_target_files(
     access_token: str, folder_id: str, base_path: str
-) -> tuple[list[dict], list[tuple[str, str]]]:
+) -> tuple[list[dict], list[tuple[str, str, str]]]:
     """
     Recursively walks the folder (Drive has no single-call recursive
     listing, the same constraint as OneDrive's Graph API -- walked one
     folder at a time). Returns (target_files, skipped) where target_files
-    is [{"file_id", "path", "size", "mime_type"}, ...] for every
-    supported, within-size-cap file, and skipped is [(path, reason), ...]
-    for everything else (wrong/unexportable type, too large).
+    is [{"file_id", "external_id", "path", "size", "mime_type",
+    "version_tag", "modified_at"}, ...] for every supported,
+    within-size-cap file, and skipped is [(path, reason, external_id), ...]
+    for everything else (wrong/unexportable type, too large). version_tag
+    is the file's md5Checksum, or "v<version>" for native Google
+    Docs/Sheets (which have no checksum) -- sync compares it to skip
+    unchanged files without downloading them.
     """
     target_files: list[dict] = []
-    skipped: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
     stack = [(folder_id, base_path)]
 
     while stack:
@@ -266,26 +270,40 @@ def list_target_files(
                         "path": f"{child_path}{export_ext}",
                         "size": 0,  # unknown pre-export; native Docs/Sheets report no size
                         "mime_type": mime_type,
+                        "external_id": child["id"],
+                        "version_tag": f"v{child['version']}" if child.get("version") else None,
+                        "modified_at": child.get("modifiedTime"),
                     }
                 )
                 continue
 
             if mime_type.startswith(_GOOGLE_APPS_PREFIX):
-                skipped.append((child_path, "unsupported Google Workspace file type"))
+                skipped.append((child_path, "unsupported Google Workspace file type", child["id"]))
                 continue
 
             ext = _extension(name)
             if ext not in SUPPORTED_EXTENSIONS:
-                skipped.append((child_path, "unsupported file type"))
+                skipped.append((child_path, "unsupported file type", child["id"]))
                 continue
 
             size = int(child.get("size") or 0)
             if size > _MAX_BYTES:
-                skipped.append((child_path, f"exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit"))
+                skipped.append(
+                    (child_path, f"exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit", child["id"])
+                )
                 continue
 
             target_files.append(
-                {"file_id": child["id"], "path": child_path, "size": size, "mime_type": mime_type}
+                {
+                    "file_id": child["id"],
+                    "external_id": child["id"],
+                    "path": child_path,
+                    "size": size,
+                    "mime_type": mime_type,
+                    "version_tag": child.get("md5Checksum")
+                    or (f"v{child['version']}" if child.get("version") else None),
+                    "modified_at": child.get("modifiedTime"),
+                }
             )
 
     return target_files, skipped

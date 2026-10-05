@@ -93,7 +93,7 @@ def _list_children(access_token: str, drive_id: str, item_id: str) -> list[dict]
     children: list[dict] = []
     url = (
         f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"
-        "?$select=id,name,size,file,folder"
+        "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime"
     )
     while url:
         resp = requests.get(url, headers=_headers(access_token), timeout=30)
@@ -112,18 +112,22 @@ def _extension(name: str) -> str:
 
 def list_target_files(
     access_token: str, drive_id: str, item_id: str, base_path: str
-) -> tuple[list[dict], list[tuple[str, str]]]:
+) -> tuple[list[dict], list[tuple[str, str, str]]]:
     """
     Recursively walks the folder (Graph has no single-call recursive
     listing the way GitHub's tree API does, so this queues and walks
     subfolders one Graph call at a time). Returns (target_files, skipped)
-    where target_files is [{"item_id", "path", "size"}, ...] for every
-    supported, within-size-cap file, and skipped is [(path, reason), ...]
-    for everything else (wrong extension, too large). base_path is
-    prefixed onto every entry purely for a readable filename/SourcePath.
+    where target_files is [{"item_id", "external_id", "path", "size",
+    "version_tag", "modified_at"}, ...] for every supported, within-size-cap
+    file, and skipped is [(path, reason, external_id), ...] for everything
+    else (wrong extension, too large). base_path is prefixed onto every
+    entry purely for a readable filename/SourcePath. version_tag is the
+    cTag, which changes only when the file's CONTENT changes (eTag also
+    changes on a rename), so sync can skip unchanged files without
+    downloading them.
     """
     target_files: list[dict] = []
-    skipped: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
     stack = [(item_id, base_path)]
 
     while stack:
@@ -141,13 +145,24 @@ def list_target_files(
             size = child.get("size", 0)
             ext = _extension(name)
             if ext not in SUPPORTED_EXTENSIONS:
-                skipped.append((child_path, "unsupported file type"))
+                skipped.append((child_path, "unsupported file type", child["id"]))
                 continue
             if size > _MAX_BYTES:
-                skipped.append((child_path, f"exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit"))
+                skipped.append(
+                    (child_path, f"exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit", child["id"])
+                )
                 continue
 
-            target_files.append({"item_id": child["id"], "path": child_path, "size": size})
+            target_files.append(
+                {
+                    "item_id": child["id"],
+                    "external_id": child["id"],
+                    "path": child_path,
+                    "size": size,
+                    "version_tag": child.get("cTag") or child.get("eTag"),
+                    "modified_at": child.get("lastModifiedDateTime"),
+                }
+            )
 
     return target_files, skipped
 

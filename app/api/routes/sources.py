@@ -18,10 +18,11 @@ files their own Google account can actually see, and if their browser's
 Google session lapses, the next call fails with a clear "sign in again"
 error rather than silently using someone else's access.
 
-Both connect and sync reuse app/services/ingestion.py's ingest_upload()
-per file -- the same parse/chunk/embed/store/dedupe pipeline as a local
-upload, just with source_type set to "onedrive"/"googledrive" and
-source_path set to the file's path within that source. One bad file
+Both connect and sync run app/services/cloud_sync.py's run_sync(): each
+cloud file is tracked by its own cloud ID, so a re-sync skips unchanged
+files, turns changed ones into new versions (with History), follows
+renames/moves, applies the local-upload version rules to new files, and
+permanently deletes documents whose file left the folder. One bad file
 (parse failure, transient network error) is recorded and skipped rather
 than aborting the whole sync.
 """
@@ -45,8 +46,7 @@ from app.schemas import (
     SyncRequest,
     SyncResponse,
 )
-from app.services import googledrive_source, onedrive_source
-from app.services.ingestion import ingest_upload
+from app.services import cloud_sync, googledrive_source, onedrive_source
 
 router = APIRouter()
 
@@ -71,69 +71,43 @@ def _sync_and_record(
     uploaded_by: User,
     source_type: str,
     target_files: list[dict],
-    skipped: list[tuple[str, str]],
+    skipped: list[tuple],
     fetch_fn: Callable[[dict], bytes],
 ) -> SyncResponse:
-    added = duplicate = failed = 0
-    details: list[SyncFileResult] = [
-        SyncFileResult(path=path, status="skipped", detail=reason) for path, reason in skipped
+    results = cloud_sync.run_sync(
+        db,
+        connection=connection,
+        user=uploaded_by,
+        source_type=source_type,
+        target_files=target_files,
+        skipped=skipped,
+        fetch_fn=fetch_fn,
+    )
+    counts = cloud_sync.summarize(results)
+    # Changes first, quiet outcomes last
+    order = [
+        "failed", "review", "updated", "added", "linked", "removed", "renamed",
+        "older_version", "excluded", "duplicate", "skipped", "unchanged",
     ]
-
-    for entry in target_files:
-        path = entry["path"]
-        try:
-            content = fetch_fn(entry)
-            if not content:
-                failed += 1
-                details.append(SyncFileResult(path=path, status="failed", detail="empty file"))
-                continue
-
-            filename = path.rsplit("/", 1)[-1]
-            result = ingest_upload(
-                db=db,
-                filename=filename,
-                content=content,
-                uploaded_by=uploaded_by,
-                source_type=source_type,
-                source_path=path,
-            )
-            if result.is_duplicate:
-                duplicate += 1
-                details.append(SyncFileResult(path=path, status="duplicate"))
-            else:
-                added += 1
-                details.append(SyncFileResult(path=path, status="added"))
-        except HTTPException as exc:
-            # ingest_upload raises this for e.g. an unparseable/empty-text
-            # file -- always before any DB write in that call, but roll
-            # back regardless so a half-flushed session never poisons the
-            # next file in this loop.
-            db.rollback()
-            failed += 1
-            details.append(SyncFileResult(path=path, status="failed", detail=str(exc.detail)))
-        except Exception as exc:  # noqa: BLE001 -- one bad file must never abort the batch
-            db.rollback()
-            failed += 1
-            details.append(SyncFileResult(path=path, status="failed", detail=str(exc)[:300]))
-
-    connection.LastSyncedAt = datetime.utcnow()
-    if failed and not added and not duplicate:
-        connection.LastSyncStatus = "error"
-        connection.LastSyncError = f"All {failed} file(s) failed -- see sync details."
-    elif failed:
-        connection.LastSyncStatus = "partial"
-        connection.LastSyncError = f"{failed} file(s) failed -- see sync details."
-    else:
-        connection.LastSyncStatus = "success"
-        connection.LastSyncError = None
-
+    results.sort(key=lambda r: (order.index(r.status), r.path.lower()))
     return SyncResponse(
         connection_id=connection.Id,
-        files_added=added,
-        files_duplicate=duplicate,
-        files_skipped=len(skipped),
-        files_failed=failed,
-        details=details,
+        files_added=counts["added"],
+        files_duplicate=counts["duplicate"],
+        files_skipped=counts["skipped"],
+        files_failed=counts["failed"],
+        files_updated=counts["updated"],
+        files_renamed=counts["renamed"],
+        files_unchanged=counts["unchanged"],
+        files_linked=counts["linked"],
+        files_review=counts["review"],
+        files_excluded=counts["excluded"],
+        files_older=counts["older_version"],
+        files_removed=counts["removed"],
+        details=[
+            SyncFileResult(path=r.path, status=r.status, detail=r.detail, document_id=r.document_id)
+            for r in results
+        ],
     )
 
 
