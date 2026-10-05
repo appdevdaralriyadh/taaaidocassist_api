@@ -69,10 +69,50 @@ class ClearMyConversationsResponse(BaseModel):
 
 
 class DocumentUploadResponse(BaseModel):
-    id: int
+    id: int  # the stored document (for 'unchanged': the existing identical one)
     filename: str
     chunk_count: int
-    is_duplicate: bool  # flagged, never blocked -- see spec §7
+    # Kept for compatibility: True exactly when outcome == 'unchanged'.
+    is_duplicate: bool
+    # 'new' | 'updated' | 'unchanged' | 'older_version' (see
+    # app/services/ingestion.py's ingest_local_upload)
+    outcome: str
+    version: int
+    previous_version: Optional[int] = None
+    # outcome == 'updated': the version that was replaced (its filename may
+    # differ from the new one) and who/when stored it; how it was
+    # recognised ('filename' | 'name_and_content' | 'content', with the
+    # two-way wording similarity 0.0-1.0 for the last two); and any other
+    # older copies/versions removed with it
+    replaced_filename: Optional[str] = None
+    replaced_at: Optional[datetime] = None
+    replaced_by: Optional[str] = None
+    matched_by: Optional[str] = None
+    similarity: Optional[float] = None
+    # the higher of the two directions, for 'content' matches/flags
+    similarity_max: Optional[float] = None
+    removed_copies: int = 0
+    removed_filenames: list[str] = Field(default_factory=list)
+    # outcome == 'unchanged': the existing document with identical content
+    # outcome == 'older_version': the existing NEWER document (upload not stored)
+    # outcome == 'new' + needs_review: the document it looked like a version of
+    matched_filename: Optional[str] = None
+    matched_source_type: Optional[str] = None
+    # outcome == 'older_version': the years that decided it
+    upload_year: Optional[int] = None
+    existing_year: Optional[int] = None
+    # outcome == 'new': True when it looked like a version of an existing
+    # document but didn't meet the automatic rules, so both were kept --
+    # `note` says why
+    needs_review: bool = False
+    note: Optional[str] = None
+    job_id: Optional[int] = None
+
+
+class DocumentDeleteResponse(BaseModel):
+    id: int
+    filename: str
+    chunks_deleted: int
 
 
 class DocumentListItem(BaseModel):
@@ -82,6 +122,7 @@ class DocumentListItem(BaseModel):
     uploaded_by: Optional[str] = None
     uploaded_at: datetime
     chunk_count: int
+    version: int = 1
 
 
 class DebugRetrievalChunk(BaseModel):

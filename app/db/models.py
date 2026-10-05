@@ -15,7 +15,15 @@ DarAI_Conversations is a later addition (sql/sqlserver2025/002_add_
 conversations_table.sql) backing the Angular sidebar's conversation list,
 rename, and delete features -- one row per conversation (Title,
 LastMessageAt), separate from DarAI_ChatHistory's one-row-per-message
-rows. Nothing else deviates from the spec's schema.
+rows.
+
+sql/sqlserver2025/003_document_versioning.sql adds document identity /
+version columns to DarAI_Documents (ConnectionId, ExternalId,
+SourceVersionTag, SourceModifiedAt, FileSizeBytes, Version, UpdatedAt,
+UpdatedBy) and two new tables, DarAI_IngestionJobs and
+DarAI_IngestionJobItems (one row per upload/sync run, and one per file in
+it -- used for progress and as each document's version history). Nothing
+else deviates from the spec's schema.
 
 This app now targets a separate, new SQL Server 2025 database, created
 from scratch by sql/sqlserver2025/001_create_schema.sql -- that single
@@ -39,6 +47,7 @@ column. Nothing else in the codebase touches Embedding via the ORM
 import uuid
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -49,6 +58,7 @@ from sqlalchemy import (
     UnicodeText,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship
 
@@ -126,7 +136,35 @@ class Document(Base):
     # (spec §7), never to block an upload outright.
     ContentHash = Column(LargeBinary(32), nullable=True)
 
-    uploader = relationship("User")
+    # --- 003_document_versioning.sql additions ---------------------------
+    # OneDrive/Google Drive connection this document came from; NULL for
+    # local uploads (and set to NULL by the DB if the connection is deleted).
+    ConnectionId = Column(
+        Integer, ForeignKey("DarAI_SourceConnections.Id", ondelete="SET NULL"), nullable=True
+    )
+    # The cloud file's own ID -- stable across renames/moves, so it's how a
+    # sync recognises "the same file". NULL for local uploads.
+    ExternalId = Column(Unicode(200), nullable=True)
+    # Cheap change marker from the source (OneDrive cTag, Google md5Checksum
+    # or version), compared on sync to skip downloading unchanged files.
+    SourceVersionTag = Column(Unicode(200), nullable=True)
+    SourceModifiedAt = Column(DateTime, nullable=True)
+    FileSizeBytes = Column(BigInteger, nullable=True)
+    # 1 for a document's first version; incremented each time newer content
+    # replaces it (same Document row, same Id -- only the chunks change).
+    Version = Column(Integer, nullable=False, server_default=text("1"))
+    # When/by whom the CURRENT version was stored (UploadedAt/UploadedBy keep
+    # meaning "first added"). UpdatedBy may be NULL on rows stored before
+    # step 2 started setting it -- fall back to UploadedBy when displaying.
+    UpdatedAt = Column(DateTime, nullable=True, server_default=func.sysutcdatetime())
+    UpdatedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=True)
+
+    # Two foreign keys to DarAI_Users now exist on this table (UploadedBy,
+    # UpdatedBy), so each relationship must say which one it follows --
+    # without foreign_keys=..., SQLAlchemy refuses to configure the mapper.
+    uploader = relationship("User", foreign_keys=[UploadedBy])
+    updater = relationship("User", foreign_keys=[UpdatedBy])
+    connection = relationship("SourceConnection")
     chunks = relationship(
         "DocumentChunk", back_populates="document", cascade="all, delete-orphan"
     )
@@ -182,3 +220,82 @@ class SourceConnection(Base):
     LastSyncError = Column(UnicodeText, nullable=True)
 
     creator = relationship("User")
+
+
+class IngestionJob(Base):
+    """
+    One upload batch or sync run (003_document_versioning.sql). Holds the
+    run's overall status and counters -- what the Upload/OneDrive/Google
+    Drive pages and the Document Library show as progress and as "last
+    checked / last updated" info.
+    """
+
+    __tablename__ = "DarAI_IngestionJobs"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    JobType = Column(Unicode(20), nullable=False)  # 'upload' | 'sync'
+    ConnectionId = Column(
+        Integer, ForeignKey("DarAI_SourceConnections.Id", ondelete="SET NULL"), nullable=True
+    )
+    # 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'interrupted'
+    Status = Column(Unicode(20), nullable=False, server_default=text("'queued'"))
+    TotalItems = Column(Integer, nullable=False, server_default=text("0"))
+    ProcessedItems = Column(Integer, nullable=False, server_default=text("0"))
+    AddedCount = Column(Integer, nullable=False, server_default=text("0"))
+    UpdatedCount = Column(Integer, nullable=False, server_default=text("0"))
+    UnchangedCount = Column(Integer, nullable=False, server_default=text("0"))
+    RemovedCount = Column(Integer, nullable=False, server_default=text("0"))
+    SkippedCount = Column(Integer, nullable=False, server_default=text("0"))
+    FailedCount = Column(Integer, nullable=False, server_default=text("0"))
+    Message = Column(Unicode(1000), nullable=True)
+    StartedBy = Column(Integer, ForeignKey("DarAI_Users.Id"), nullable=False)
+    CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    StartedAt = Column(DateTime, nullable=True)
+    FinishedAt = Column(DateTime, nullable=True)
+
+    starter = relationship("User")
+    connection = relationship("SourceConnection")
+    items = relationship(
+        "IngestionJobItem", back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class IngestionJobItem(Base):
+    """
+    One file within an IngestionJob: its live step/progress while the job
+    runs, then its outcome. Also serves as each document's version history
+    (all items with a given DocumentId, newest first).
+
+    DocumentId / RelatedDocumentId are plain integers, not foreign keys, on
+    purpose: history has to survive the document being replaced or deleted
+    (see 003_document_versioning.sql).
+    """
+
+    __tablename__ = "DarAI_IngestionJobItems"
+
+    Id = Column(Integer, primary_key=True, autoincrement=True)
+    JobId = Column(
+        Integer, ForeignKey("DarAI_IngestionJobs.Id", ondelete="CASCADE"), nullable=False
+    )
+    FileName = Column(Unicode(255), nullable=False)
+    SourcePath = Column(Unicode(500), nullable=True)
+    ExternalId = Column(Unicode(200), nullable=True)
+    # 'queued' | 'downloading' | 'extracting' | 'embedding' | 'saving' | 'done'
+    Step = Column(Unicode(30), nullable=False, server_default=text("'queued'"))
+    ProgressCurrent = Column(Integer, nullable=True)
+    ProgressTotal = Column(Integer, nullable=True)
+    # 'new' | 'updated' | 'unchanged' | 'possible_version' | 'renamed'
+    # | 'removed' | 'skipped' | 'failed'
+    Outcome = Column(Unicode(30), nullable=True)
+    DocumentId = Column(Integer, nullable=True)
+    RelatedDocumentId = Column(Integer, nullable=True)
+    PreviousVersion = Column(Integer, nullable=True)
+    NewVersion = Column(Integer, nullable=True)
+    ContentHash = Column(LargeBinary(32), nullable=True)
+    FileSizeBytes = Column(BigInteger, nullable=True)
+    ChunkCount = Column(Integer, nullable=True)
+    Message = Column(Unicode(1000), nullable=True)
+    CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+    UpdatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
+
+    job = relationship("IngestionJob", back_populates="items")

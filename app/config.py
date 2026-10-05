@@ -123,6 +123,46 @@ class Settings(BaseSettings):
     # --- Upload limits (Phase 2, spec §7) ---
     MAX_UPLOAD_SIZE_MB: int = 25
 
+    # --- Document versioning (upload rework) ---
+    # The upload decides automatically whether a file is a new version of
+    # an existing upload (see app/services/doc_matching.py). All similarity
+    # values are 0.0-1.0 "two-way" scores: the LOWER of (share of the new
+    # file's 3-word sequences found in the old) and (share of the old's
+    # found in the new) -- so both documents must be mostly made of the
+    # other's wording. Every decision records its actual score in the upload
+    # history (DarAI_IngestionJobItems.Message), so these can be tuned
+    # against real documents. Exact same-filename uploads always replace.
+    #
+    # Name matches once version words are stripped ("Gift Policy 2026.pdf"
+    # vs "Gift Policy 2026 new version.pdf"): replace at or above this.
+    VERSION_MATCH_MIN_SIMILARITY: float = 0.5
+    # Name does NOT match: the content alone has to carry the decision, so
+    # the two directions are judged separately -- replace only when at
+    # least CONTENT_MATCH_MIN_SIMILARITY of one document's wording is in
+    # the other (e.g. most of the old text carried into the new one) AND at
+    # least CONTENT_MATCH_MIN_COVERAGE the other way. Added/removed
+    # sections only lower one direction, so genuine revisions still pass;
+    # an excerpt, or a document that merely contains another, fails the
+    # second check. Never applies when the two names look like siblings in
+    # a series ("NDA Vendor A" / "NDA Vendor B"), which can be
+    # near-identical template text while being different documents.
+    CONTENT_MATCH_MIN_SIMILARITY: float = 0.8
+    CONTENT_MATCH_MIN_COVERAGE: float = 0.6
+    # Name does NOT match, and the wording is close but short of the two
+    # values above (at least this much one way): keep both, but flag the
+    # upload as a possible version of the other document for review.
+    POSSIBLE_VERSION_MIN_SIMILARITY: float = 0.5
+    # A content-only match also needs both documents to have at least this
+    # many words -- very short files (forms, one-liners) don't carry enough
+    # wording to judge, and are always kept separate.
+    CONTENT_MATCH_MIN_WORDS: int = 150
+    # Finding content-only candidates: a sample of the upload's chunk
+    # embeddings is searched against the knowledge base, and any document
+    # with a chunk this close (cosine distance) gets its wording compared.
+    # Deliberately generous -- it only decides which documents to CHECK; the
+    # wording comparison above makes the actual decision.
+    VERSION_CANDIDATE_MAX_DISTANCE: float = 0.15
+
     # --- Retrieval / query routing (Phase 3, spec §3.3/§3.4) ---
     # Cosine DISTANCE cutoff a chunk must clear before the assistant
     # answers from the knowledge base instead of general knowledge --
