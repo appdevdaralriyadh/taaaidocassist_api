@@ -18,6 +18,8 @@ app registration are both required before this works end to end.
 """
 
 import base64
+import re
+from urllib.parse import urlparse
 from dataclasses import dataclass
 
 import requests
@@ -52,10 +54,63 @@ def _headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+_LINK_HELP = (
+    "A OneDrive/SharePoint shared-folder link looks like "
+    "https://yourcompany-my.sharepoint.com/:f:/g/... or https://1drv.ms/f/... -- in OneDrive, "
+    "open the folder's Share menu and choose Copy link."
+)
+_ONEDRIVE_HOSTS = ("sharepoint.com", "1drv.ms", "onedrive.live.com", "onedrive.com")
+# SharePoint/OneDrive short links say what they point to: /:f:/ is a
+# folder; /:w:/ Word, /:x:/ Excel, /:p:/ PowerPoint, /:b:/ PDF, /:t:/ text,
+# /:i:/ image, /:v:/ video, /:u:/ other file.
+_FILE_LINK_CODES = {"w", "x", "p", "b", "t", "i", "v", "u"}
+
+
+def validate_shared_link(shared_link: str) -> str:
+    """
+    Checks a pasted link looks like a OneDrive/SharePoint folder link before
+    calling Microsoft, so the person gets a message that says what's wrong.
+    Returns the cleaned link; raises OneDriveConnectionError otherwise.
+    """
+    link = (shared_link or "").strip()
+    if not link:
+        raise OneDriveConnectionError("Paste a OneDrive or SharePoint shared-folder link.")
+    lowered = link.lower()
+    if "drive.google.com" in lowered or "docs.google.com" in lowered:
+        raise OneDriveConnectionError(
+            "That's a Google Drive link -- connect it on the Google Drive page instead."
+        )
+    parsed = urlparse(link)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise OneDriveConnectionError(
+            "That isn't a valid link -- paste the full shared-folder link (it starts with "
+            "https://). " + _LINK_HELP
+        )
+    host = parsed.netloc.lower().split(":")[0]
+    if not any(host == h or host.endswith("." + h) for h in _ONEDRIVE_HOSTS):
+        raise OneDriveConnectionError(
+            f"That isn't a valid OneDrive link -- '{host}' isn't a OneDrive or SharePoint "
+            "address. " + _LINK_HELP
+        )
+    code = re.match(r"^/:([a-z]):/", parsed.path.lower())
+    if code and code.group(1) in _FILE_LINK_CODES:
+        raise OneDriveConnectionError(
+            "That's a link to a single file, not a folder. Share the folder that contains it "
+            "and paste that link instead."
+        )
+    return link
+
+
 def _raise_for_response(resp: requests.Response, action: str) -> None:
     if resp.status_code == 401:
         raise OneDriveConnectionError(
-            "The Microsoft Graph token was rejected (expired, or missing the Files.Read scope)."
+            "Your Microsoft sign-in for OneDrive has expired or doesn't include file access -- "
+            "click Connect (or Sync Now) again and sign in when asked."
+        )
+    if resp.status_code == 403:
+        raise OneDriveConnectionError(
+            f"Access denied while {action} -- your Microsoft account doesn't have access to "
+            "this folder. Ask the folder's owner to share it with you, then try again."
         )
     if resp.status_code == 404:
         raise OneDriveConnectionError(f"Not found while {action} (404 from Microsoft Graph).")
@@ -71,15 +126,16 @@ def resolve_shared_folder(access_token: str, shared_link: str) -> dict:
     OneDriveConnectionError with a clean message on any failure, or if the
     link points to a file rather than a folder.
     """
-    if not shared_link or not shared_link.strip():
-        raise OneDriveConnectionError("Paste a OneDrive or SharePoint shared-folder link.")
+    shared_link = validate_shared_link(shared_link)
 
     share_id = _encode_share_id(shared_link)
     url = f"{_GRAPH_BASE}/shares/{share_id}/driveItem"
     resp = requests.get(url, headers=_headers(access_token), timeout=30)
-    if resp.status_code == 404:
+    if resp.status_code in (400, 404):
         raise OneDriveConnectionError(
-            "That link couldn't be resolved -- check it's a valid OneDrive/SharePoint sharing link."
+            "That OneDrive link doesn't work -- the folder may have been deleted or moved, the "
+            "sharing link may have been turned off, or the link was copied incompletely. Copy a "
+            "fresh link from the folder's Share menu and try again."
         )
     _raise_for_response(resp, "resolving the shared link")
 

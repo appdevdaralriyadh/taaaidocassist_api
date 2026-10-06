@@ -29,6 +29,7 @@ needed at all for this token-based approach.
 
 import re
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -61,6 +62,12 @@ _FOLDER_ID_IN_URL = re.compile(r"/folders/([a-zA-Z0-9_-]+)")
 _ID_QUERY_PARAM = re.compile(r"[?&]id=([a-zA-Z0-9_-]+)")
 
 
+_LINK_HELP = (
+    "A Google Drive folder link looks like https://drive.google.com/drive/folders/... -- in "
+    "Google Drive, right-click the folder, choose Share, then Copy link."
+)
+
+
 class GoogleDrivePathError(ValueError):
     """The pasted folder link/ID couldn't be parsed."""
 
@@ -82,6 +89,24 @@ def parse_drive_path(raw: str) -> str:
     if not text:
         raise GoogleDrivePathError("Paste a Google Drive folder link or folder ID.")
 
+    lowered = text.lower()
+    if "sharepoint.com" in lowered or "1drv.ms" in lowered or "onedrive.live.com" in lowered:
+        raise GoogleDrivePathError(
+            "That's a OneDrive / SharePoint link -- connect it on the OneDrive page instead."
+        )
+    if lowered.startswith(("http://", "https://")):
+        host = urlparse(text).netloc.lower().split(":")[0]
+        if host not in ("drive.google.com", "docs.google.com"):
+            raise GoogleDrivePathError(
+                f"That isn't a valid Google Drive link -- '{host}' isn't a Google Drive address. "
+                + _LINK_HELP
+            )
+        if "/file/d/" in lowered or "docs.google.com/" in lowered:
+            raise GoogleDrivePathError(
+                "That's a link to a single file, not a folder. Share the folder that contains "
+                "it and paste that link instead."
+            )
+
     match = _FOLDER_ID_IN_URL.search(text)
     if match:
         return match.group(1)
@@ -92,13 +117,15 @@ def parse_drive_path(raw: str) -> str:
 
     if text.lower().startswith(("http://", "https://")):
         raise GoogleDrivePathError(
-            "Couldn't find a folder ID in that link -- paste the full "
-            "folder URL from Google Drive's 'Get link' option."
+            "That isn't a valid Google Drive folder link -- no folder ID was found in it. "
+            + _LINK_HELP
         )
 
     # Bare ID shorthand -- Drive IDs never contain whitespace or slashes.
     if " " in text or "/" in text:
-        raise GoogleDrivePathError("Expected a Google Drive folder link or a bare folder ID.")
+        raise GoogleDrivePathError(
+            "That isn't a valid Google Drive folder link or folder ID. " + _LINK_HELP
+        )
     return text
 
 
@@ -163,8 +190,10 @@ def _raise_for_response(resp: requests.Response, action: str) -> None:
         )
     if resp.status_code == 404:
         raise GoogleDriveConnectionError(
-            f"Not found while {action} -- check the folder link/ID, and that the "
-            "Google account you're signed in as has access to it."
+            f"Not found while {action} -- the folder may have been deleted or moved, the link "
+            "may be incomplete, or the Google account you signed in with doesn't have access to "
+            "it. Copy a fresh link from the folder's Share menu, or ask its owner to share it "
+            "with that account."
         )
     if not resp.ok:
         raise GoogleDriveConnectionError(
