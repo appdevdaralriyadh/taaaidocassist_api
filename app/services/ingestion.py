@@ -519,10 +519,14 @@ def _finish_job(
     new_version: Optional[int] = None,
     chunk_count: Optional[int] = None,
     message: Optional[str] = None,
+    keep_running: bool = False,
 ) -> None:
     """Records the item's outcome and the job's totals. Does NOT commit --
     callers commit it together with the document change it describes, so
-    the history and the knowledge base can never disagree."""
+    the history and the knowledge base can never disagree. keep_running:
+    leave the job 'running' -- the background worker (app/services/jobs.py)
+    finishes it together with the result the Upload page shows, so the page
+    never sees a finished job without its result."""
     short_message = message[:1000] if message else None
 
     item = db.get(IngestionJobItem, item_id)
@@ -545,18 +549,82 @@ def _finish_job(
     job.UnchangedCount = 1 if outcome == "unchanged" else 0
     job.SkippedCount = 1 if outcome == "older_version" else 0
     job.FailedCount = 1 if outcome == "failed" else 0
-    job.Status = "failed" if outcome == "failed" else "completed"
     job.Message = short_message
-    job.FinishedAt = func.sysutcdatetime()
+    if not keep_running:
+        job.Status = "failed" if outcome == "failed" else "completed"
+        job.FinishedAt = func.sysutcdatetime()
 
 
-def _record_failure(db: Session, job_id: int, item_id: int, message: str) -> None:
+def _record_failure(
+    db: Session, job_id: int, item_id: int, message: str, keep_running: bool = False
+) -> None:
     # Called after a rollback, in a fresh transaction.
     try:
-        _finish_job(db, job_id=job_id, item_id=item_id, outcome="failed", message=message)
+        _finish_job(
+            db, job_id=job_id, item_id=item_id, outcome="failed", message=message,
+            keep_running=keep_running,
+        )
         db.commit()
     except Exception:  # noqa: BLE001 -- never let history-writing mask the real error
         db.rollback()
+
+
+def upload_needs_embedding(db: Session, *, filename: str, content_hash: bytes) -> bool:
+    """
+    Read-only look-ahead for the background worker: False when
+    ingest_local_upload will finish without embedding (identical content
+    already stored, in Deleted, or an earlier version) -- so no time is
+    spent embedding a file that won't be stored. Re-checked under the save
+    lock, so a wrong guess only costs time.
+    """
+    identical = (
+        db.query(Document.Id)
+        .filter(
+            Document.ContentHash == content_hash,
+            Document.Status.in_((doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED)),
+        )
+        .first()
+    )
+    if identical is not None:
+        return False
+    in_history = doc_history.find_in_history_by_hash(db, content_hash)
+    if in_history is None:
+        return True
+    if in_history[0] == "previous":
+        return False
+    return doc_history.name_in_use(db, filename, except_document_id=in_history[1].Id) is not None
+
+
+def upload_result_dict(result: "LocalUploadResult") -> dict:
+    """What the Upload page shows for a finished file (DocumentUploadResponse)."""
+    return {
+        "id": result.document.Id,
+        "filename": result.document.FileName,
+        "chunk_count": result.chunk_count,
+        "is_duplicate": result.outcome == "unchanged",
+        "outcome": result.outcome,
+        "version": result.version,
+        "previous_version": result.previous_version,
+        "replaced_filename": result.replaced_filename,
+        "replaced_at": result.replaced_at.isoformat() if isinstance(result.replaced_at, datetime) else result.replaced_at,
+        "replaced_by": result.replaced_by,
+        "matched_by": result.matched_by,
+        "similarity": result.similarity,
+        "similarity_max": result.similarity_max,
+        "removed_copies": result.removed_copies,
+        "removed_filenames": result.removed_filenames,
+        "matched_filename": result.matched_filename,
+        "matched_source_type": result.matched_source_type,
+        "upload_year": result.upload_year,
+        "existing_year": result.existing_year,
+        "needs_review": result.needs_review,
+        "note": result.note,
+        "job_id": result.job_id,
+        "retention_days": result.retention_days,
+        "removed_retention_days": result.removed_retention_days,
+        "renamed_from": result.renamed_from,
+        "never_merge_with": result.never_merge_with,
+    }
 
 
 def ingest_local_upload(
@@ -565,14 +633,27 @@ def ingest_local_upload(
     filename: str,
     content: bytes,
     uploaded_by: User,
+    job_ids: Optional[tuple] = None,
+    prepared: Optional[tuple] = None,
 ) -> LocalUploadResult:
+    """
+    job_ids:  (job_id, item_id) already created by the background queue
+              (app/services/jobs.py); otherwise a job is started here.
+    prepared: (chunks, vectors) already extracted and embedded by the
+              background worker outside the save lock, so the slow part
+              doesn't hold up other files; computed here when absent.
+    """
     content_hash = hashlib.sha256(content).digest()
     # One snapshot of the Settings page values for this whole upload, so
     # every rule in it is judged against the same thresholds.
     cfg = app_settings.get_effective(db)
-    job_id, item_id = _start_job(
-        db, user=uploaded_by, filename=filename, content_hash=content_hash, size=len(content)
-    )
+    background = job_ids is not None
+    if background:
+        job_id, item_id = job_ids
+    else:
+        job_id, item_id = _start_job(
+            db, user=uploaded_by, filename=filename, content_hash=content_hash, size=len(content)
+        )
 
     try:
         # 1. Identical content anywhere in the knowledge base (any source,
@@ -615,6 +696,7 @@ def ingest_local_upload(
                 )
             _finish_job(
                 db,
+                keep_running=background,
                 job_id=job_id,
                 item_id=item_id,
                 outcome="restored",
@@ -651,6 +733,7 @@ def ingest_local_upload(
             chunks_existing = _chunk_count(db, current_doc.Id)
             _finish_job(
                 db,
+                keep_running=background,
                 job_id=job_id,
                 item_id=item_id,
                 outcome="unchanged",
@@ -676,6 +759,7 @@ def ingest_local_upload(
             chunks_existing = _chunk_count(db, identical.Id)
             _finish_job(
                 db,
+                keep_running=background,
                 job_id=job_id,
                 item_id=item_id,
                 outcome="unchanged",
@@ -697,9 +781,12 @@ def ingest_local_upload(
 
         # Heavy work happens before any document is touched: if parsing or
         # embedding fails, nothing has been deleted yet.
-        chunks = _extract_chunks(filename, content)
+        if prepared is not None:
+            chunks, vectors = prepared
+        else:
+            chunks = _extract_chunks(filename, content)
+            vectors = embed_texts(chunks)
         new_text = " ".join(chunks)
-        vectors = embed_texts(chunks)
 
         # 2. Is this a new version of an existing local upload?
         matches, near_miss = _find_version_matches(
@@ -729,6 +816,7 @@ def ingest_local_upload(
                 )
                 _finish_job(
                     db,
+                    keep_running=background,
                     job_id=job_id,
                     item_id=item_id,
                     outcome="older_version",
@@ -846,6 +934,7 @@ def ingest_local_upload(
                 )
             _finish_job(
                 db,
+                keep_running=background,
                 job_id=job_id,
                 item_id=item_id,
                 outcome="updated",
@@ -906,6 +995,7 @@ def ingest_local_upload(
 
         _finish_job(
             db,
+            keep_running=background,
             job_id=job_id,
             item_id=item_id,
             # 'possible_version' in the history = added, but worth a look
@@ -935,11 +1025,11 @@ def ingest_local_upload(
 
     except HTTPException as exc:
         db.rollback()
-        _record_failure(db, job_id, item_id, str(exc.detail))
+        _record_failure(db, job_id, item_id, str(exc.detail), keep_running=background)
         raise
     except Exception as exc:
         db.rollback()
-        _record_failure(db, job_id, item_id, str(exc)[:1000] or exc.__class__.__name__)
+        _record_failure(db, job_id, item_id, str(exc)[:1000] or exc.__class__.__name__, keep_running=background)
         raise
 
 

@@ -18,18 +18,19 @@ files their own Google account can actually see, and if their browser's
 Google session lapses, the next call fails with a clear "sign in again"
 error rather than silently using someone else's access.
 
-Both connect and sync run app/services/cloud_sync.py's run_sync(): each
-cloud file is tracked by its own cloud ID, so a re-sync skips unchanged
-files, turns changed ones into new versions (with History), follows
-renames/moves, applies the local-upload version rules to new files, and
-permanently deletes documents whose file left the folder. One bad file
-(parse failure, transient network error) is recorded and skipped rather
-than aborting the whole sync.
+Connect checks the folder and saves the connection; the sync itself --
+on connect and on every Sync Now -- runs in the background
+(app/services/jobs.py, using app/services/cloud_sync.py's rules: each
+cloud file is tracked by its own cloud ID, unchanged files are skipped,
+changed ones become new versions with History, renames/moves are
+followed, new files get the local-upload version rules, and documents
+whose file left the folder are permanently deleted). The page follows
+its progress via GET /api/documents/jobs/{job_id}. One bad file is
+recorded and skipped rather than aborting the whole sync.
 """
 
 import json
-from datetime import datetime
-from typing import Callable, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -38,15 +39,14 @@ from app.api.dependencies import get_current_user
 from app.db.models import SourceConnection, User
 from app.db.session import get_db
 from app.schemas import (
-    ConnectResponse,
+    ConnectStartResponse,
     GoogleDriveConnectRequest,
     OneDriveConnectRequest,
     SourceConnectionItem,
-    SyncFileResult,
     SyncRequest,
-    SyncResponse,
+    SyncStartResponse,
 )
-from app.services import cloud_sync, googledrive_source, onedrive_source
+from app.services import googledrive_source, jobs, onedrive_source
 
 router = APIRouter()
 
@@ -64,53 +64,6 @@ def _to_item(connection: SourceConnection, created_by_name: Optional[str]) -> So
     )
 
 
-def _sync_and_record(
-    db: Session,
-    *,
-    connection: SourceConnection,
-    uploaded_by: User,
-    source_type: str,
-    target_files: list[dict],
-    skipped: list[tuple],
-    fetch_fn: Callable[[dict], bytes],
-) -> SyncResponse:
-    results = cloud_sync.run_sync(
-        db,
-        connection=connection,
-        user=uploaded_by,
-        source_type=source_type,
-        target_files=target_files,
-        skipped=skipped,
-        fetch_fn=fetch_fn,
-    )
-    counts = cloud_sync.summarize(results)
-    # Changes first, quiet outcomes last
-    order = [
-        "failed", "review", "updated", "added", "linked", "removed", "renamed",
-        "older_version", "excluded", "duplicate", "skipped", "unchanged",
-    ]
-    results.sort(key=lambda r: (order.index(r.status), r.path.lower()))
-    return SyncResponse(
-        connection_id=connection.Id,
-        files_added=counts["added"],
-        files_duplicate=counts["duplicate"],
-        files_skipped=counts["skipped"],
-        files_failed=counts["failed"],
-        files_updated=counts["updated"],
-        files_renamed=counts["renamed"],
-        files_unchanged=counts["unchanged"],
-        files_linked=counts["linked"],
-        files_review=counts["review"],
-        files_excluded=counts["excluded"],
-        files_older=counts["older_version"],
-        files_removed=counts["removed"],
-        details=[
-            SyncFileResult(path=r.path, status=r.status, detail=r.detail, document_id=r.document_id)
-            for r in results
-        ],
-    )
-
-
 @router.get("/connections", response_model=list[SourceConnectionItem])
 def list_connections(
     _user: User = Depends(get_current_user),
@@ -125,12 +78,42 @@ def list_connections(
     return [_to_item(connection, display_name) for connection, display_name in rows]
 
 
-@router.post("/googledrive/connect", response_model=ConnectResponse)
+def _source_fns(connection: SourceConnection, access_token: str):
+    """(list_fn, fetch_fn) for one connection, bound to the caller's token."""
+    config = json.loads(connection.ConfigJson)
+    if connection.SourceType == "googledrive":
+        def list_fn(on_progress=None):
+            return googledrive_source.list_target_files(
+                access_token, config["folder_id"], config["path"], on_progress=on_progress
+            )
+
+        def fetch_fn(entry: dict) -> bytes:
+            return googledrive_source.fetch_file_content(access_token, entry)
+
+        return list_fn, fetch_fn
+    if connection.SourceType == "onedrive":
+        def list_fn(on_progress=None):
+            return onedrive_source.list_target_files(
+                access_token, config["drive_id"], config["item_id"], config["path"],
+                on_progress=on_progress,
+            )
+
+        def fetch_fn(entry: dict) -> bytes:
+            return onedrive_source.fetch_file_content(
+                access_token, config["drive_id"], entry["item_id"]
+            )
+
+        return list_fn, fetch_fn
+    raise HTTPException(status_code=400, detail=f"Unknown source type '{connection.SourceType}'.")
+
+
+@router.post("/googledrive/connect", response_model=ConnectStartResponse)
 def connect_googledrive(
     payload: GoogleDriveConnectRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Checks the folder, saves the connection, and starts its first sync in the background."""
     try:
         folder_id = googledrive_source.parse_drive_path(payload.folder_path)
     except googledrive_source.GoogleDrivePathError as exc:
@@ -138,9 +121,6 @@ def connect_googledrive(
 
     try:
         folder = googledrive_source.resolve_folder(payload.access_token, folder_id)
-        target_files, skipped = googledrive_source.list_target_files(
-            payload.access_token, folder_id, folder.get("name", "")
-        )
     except googledrive_source.GoogleDriveConnectionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -156,30 +136,19 @@ def connect_googledrive(
     db.add(connection)
     db.flush()  # assigns connection.Id without ending the transaction
 
-    def _fetch(entry: dict) -> bytes:
-        return googledrive_source.fetch_file_content(payload.access_token, entry)
-
-    sync_result = _sync_and_record(
-        db,
-        connection=connection,
-        uploaded_by=user,
-        source_type="googledrive",
-        target_files=target_files,
-        skipped=skipped,
-        fetch_fn=_fetch,
-    )
-    db.commit()
+    list_fn, fetch_fn = _source_fns(connection, payload.access_token)
+    job_id = jobs.start_sync(db, connection=connection, user=user, list_fn=list_fn, fetch_fn=fetch_fn)
     db.refresh(connection)
+    return ConnectStartResponse(connection=_to_item(connection, user.DisplayName), job_id=job_id)
 
-    return ConnectResponse(connection=_to_item(connection, user.DisplayName), sync=sync_result)
 
-
-@router.post("/onedrive/connect", response_model=ConnectResponse)
+@router.post("/onedrive/connect", response_model=ConnectStartResponse)
 def connect_onedrive(
     payload: OneDriveConnectRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Checks the folder, saves the connection, and starts its first sync in the background."""
     try:
         item = onedrive_source.resolve_shared_folder(payload.access_token, payload.shared_link)
     except onedrive_source.OneDriveConnectionError as exc:
@@ -188,13 +157,6 @@ def connect_onedrive(
     drive_id = item["parentReference"]["driveId"]
     item_id = item["id"]
     base_path = item.get("name", "")
-
-    try:
-        target_files, skipped = onedrive_source.list_target_files(
-            payload.access_token, drive_id, item_id, base_path
-        )
-    except onedrive_source.OneDriveConnectionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
     label = payload.display_label or base_path or "OneDrive folder"
     config = {"drive_id": drive_id, "item_id": item_id, "path": base_path}
@@ -208,102 +170,28 @@ def connect_onedrive(
     db.add(connection)
     db.flush()
 
-    def _fetch(entry: dict) -> bytes:
-        return onedrive_source.fetch_file_content(payload.access_token, drive_id, entry["item_id"])
-
-    sync_result = _sync_and_record(
-        db,
-        connection=connection,
-        uploaded_by=user,
-        source_type="onedrive",
-        target_files=target_files,
-        skipped=skipped,
-        fetch_fn=_fetch,
-    )
-    db.commit()
+    list_fn, fetch_fn = _source_fns(connection, payload.access_token)
+    job_id = jobs.start_sync(db, connection=connection, user=user, list_fn=list_fn, fetch_fn=fetch_fn)
     db.refresh(connection)
+    return ConnectStartResponse(connection=_to_item(connection, user.DisplayName), job_id=job_id)
 
-    return ConnectResponse(connection=_to_item(connection, user.DisplayName), sync=sync_result)
 
-
-@router.post("/connections/{connection_id}/sync", response_model=SyncResponse)
+@router.post("/connections/{connection_id}/sync", response_model=SyncStartResponse)
 def sync_connection(
     connection_id: int,
     payload: SyncRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """Starts a sync in the background; progress via GET /api/documents/jobs/{job_id}."""
     connection = db.get(SourceConnection, connection_id)
     if connection is None:
         raise HTTPException(status_code=404, detail="Connection not found.")
-
-    config = json.loads(connection.ConfigJson)
-
-    if connection.SourceType == "googledrive":
-        if not payload.access_token:
-            raise HTTPException(
-                status_code=400,
-                detail="access_token is required to sync a Google Drive connection.",
-            )
-        try:
-            target_files, skipped = googledrive_source.list_target_files(
-                payload.access_token, config["folder_id"], config["path"]
-            )
-        except googledrive_source.GoogleDriveConnectionError as exc:
-            connection.LastSyncedAt = datetime.utcnow()
-            connection.LastSyncStatus = "error"
-            connection.LastSyncError = str(exc)
-            db.commit()
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        def _fetch(entry: dict) -> bytes:
-            return googledrive_source.fetch_file_content(payload.access_token, entry)
-
-        sync_result = _sync_and_record(
-            db,
-            connection=connection,
-            uploaded_by=user,
-            source_type="googledrive",
-            target_files=target_files,
-            skipped=skipped,
-            fetch_fn=_fetch,
-        )
-
-    elif connection.SourceType == "onedrive":
-        if not payload.access_token:
-            raise HTTPException(
-                status_code=400, detail="access_token is required to sync a OneDrive connection."
-            )
-        try:
-            target_files, skipped = onedrive_source.list_target_files(
-                payload.access_token, config["drive_id"], config["item_id"], config["path"]
-            )
-        except onedrive_source.OneDriveConnectionError as exc:
-            connection.LastSyncedAt = datetime.utcnow()
-            connection.LastSyncStatus = "error"
-            connection.LastSyncError = str(exc)
-            db.commit()
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        def _fetch(entry: dict) -> bytes:
-            return onedrive_source.fetch_file_content(
-                payload.access_token, config["drive_id"], entry["item_id"]
-            )
-
-        sync_result = _sync_and_record(
-            db,
-            connection=connection,
-            uploaded_by=user,
-            source_type="onedrive",
-            target_files=target_files,
-            skipped=skipped,
-            fetch_fn=_fetch,
-        )
-
-    else:
+    if not payload.access_token:
         raise HTTPException(
-            status_code=400, detail=f"Unknown source type '{connection.SourceType}'."
+            status_code=400,
+            detail="Your sign-in for this folder is missing -- click Sync Now again and sign in when asked.",
         )
-
-    db.commit()
-    return sync_result
+    list_fn, fetch_fn = _source_fns(connection, payload.access_token)
+    job_id = jobs.start_sync(db, connection=connection, user=user, list_fn=list_fn, fetch_fn=fetch_fn)
+    return SyncStartResponse(connection_id=connection.Id, job_id=job_id)

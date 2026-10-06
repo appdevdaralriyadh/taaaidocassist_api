@@ -209,5 +209,15 @@ class Settings(BaseSettings):
     MAX_COSINE_DISTANCE: float = 0.35
     TOP_K_CHUNKS: int = 5
 
+    # --- Background uploads / syncs (app/services/jobs.py) ---
+    # How many files are read + embedded at the same time (embedding runs
+    # on this server's CPU, so more at once can slow chat replies).
+    # Checking versions and saving always happen one file at a time.
+    JOB_WORKERS: int = 2
+    # Where uploaded files wait until they're processed, so uploads still
+    # queued or in progress continue after an API restart. Empty = an
+    # "upload_spool" folder next to the app folder.
+    UPLOAD_SPOOL_DIR: str = ""
+
 
 settings = Settings()

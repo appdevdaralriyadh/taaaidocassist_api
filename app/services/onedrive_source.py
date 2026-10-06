@@ -167,7 +167,11 @@ def _extension(name: str) -> str:
 
 
 def list_target_files(
-    access_token: str, drive_id: str, item_id: str, base_path: str
+    access_token: str,
+    drive_id: str,
+    item_id: str,
+    base_path: str,
+    on_progress=None,
 ) -> tuple[list[dict], list[tuple[str, str, str]]]:
     """
     Recursively walks the folder (Graph has no single-call recursive
@@ -186,7 +190,13 @@ def list_target_files(
     skipped: list[tuple[str, str, str]] = []
     stack = [(item_id, base_path)]
 
+    folders_done = 0
     while stack:
+        if on_progress is not None:
+            # (files found so far, folders read so far) -- for the sync's
+            # progress line; may raise to stop listing (Cancel)
+            on_progress(len(target_files) + len(skipped), folders_done)
+        folders_done += 1
         current_id, current_path = stack.pop()
         for child in _list_children(access_token, drive_id, current_id):
             name = child["name"]

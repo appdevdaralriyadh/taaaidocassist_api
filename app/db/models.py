@@ -324,6 +324,9 @@ class IngestionJobItem(Base):
     FileSizeBytes = Column(BigInteger, nullable=True)
     ChunkCount = Column(Integer, nullable=True)
     Message = Column(Unicode(1000), nullable=True)
+    # The full result shown on the Upload / sync pages once the file is done
+    # (JSON; 006_background_jobs.sql). NULL while it's still being processed.
+    ResultJson = Column(UnicodeText, nullable=True)
     CreatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
     UpdatedAt = Column(DateTime, nullable=False, server_default=func.sysutcdatetime())
 

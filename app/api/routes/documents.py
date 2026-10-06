@@ -22,11 +22,12 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import func
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
 from app.config import settings
-from app.db.models import Document, DocumentChunk, User
+from app.db.models import Document, DocumentChunk, DocumentVersion, User
 from app.db.session import get_db
 from app.schemas import (
     DeletedDocumentItem,
@@ -39,25 +40,29 @@ from app.schemas import (
     DocumentRenameResponse,
     DocumentRestoreRequest,
     DocumentRestoreResponse,
-    DocumentUploadResponse,
+    JobOut,
     SeparateRestoreRequest,
     SeparateRestoreResponse,
+    UploadQueuedResponse,
     VersionRestoreResponse,
 )
-from app.services import app_settings, doc_history, ingestion, retention
+from app.services import app_settings, doc_history, ingestion, jobs, retention
 from app.services.ingestion import delete_document as delete_document_service
-from app.services.ingestion import ingest_local_upload, restore_document
+from app.services.ingestion import restore_document
 
 router = APIRouter()
 
 # Permanently deletes items past their retention period, in the background
 # (app/services/retention.py) -- started here so main.py needn't change.
 retention.start_background_cleanup()
+# Picks up uploads left waiting by an API restart, and keeps background
+# work tidy (app/services/jobs.py).
+jobs.start_upkeep()
 
 _MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 
-@router.post("/upload", response_model=DocumentUploadResponse)
+@router.post("/upload", response_model=UploadQueuedResponse)
 async def upload_document(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
@@ -79,38 +84,11 @@ async def upload_document(
             ),
         )
 
-    result = ingest_local_upload(
-        db=db, filename=file.filename, content=content, uploaded_by=user
-    )
-
-    return DocumentUploadResponse(
-        id=result.document.Id,
-        filename=result.document.FileName,
-        chunk_count=result.chunk_count,
-        is_duplicate=result.outcome == "unchanged",
-        outcome=result.outcome,
-        version=result.version,
-        previous_version=result.previous_version,
-        replaced_filename=result.replaced_filename,
-        replaced_at=result.replaced_at,
-        replaced_by=result.replaced_by,
-        matched_by=result.matched_by,
-        similarity=result.similarity,
-        similarity_max=result.similarity_max,
-        removed_copies=result.removed_copies,
-        removed_filenames=result.removed_filenames,
-        matched_filename=result.matched_filename,
-        matched_source_type=result.matched_source_type,
-        upload_year=result.upload_year,
-        existing_year=result.existing_year,
-        needs_review=result.needs_review,
-        note=result.note,
-        job_id=result.job_id,
-        retention_days=result.retention_days,
-        removed_retention_days=result.removed_retention_days,
-        renamed_from=result.renamed_from,
-        never_merge_with=result.never_merge_with,
-    )
+    # Processed in the background (app/services/jobs.py); the page follows
+    # it via GET /jobs?ids=... and gets the same result fields as before
+    # (DocumentUploadResponse) in the item's `result` once it's done.
+    job_id, item_id = jobs.queue_upload(db, user=user, filename=file.filename, content=content)
+    return UploadQueuedResponse(job_id=job_id, item_id=item_id, filename=file.filename)
 
 
 @router.delete("/{document_id}", response_model=DocumentDeleteResponse)
@@ -202,14 +180,43 @@ def list_documents(
         .subquery()
     )
 
+    # Same shape for the version figures: previous versions still in History,
+    # and the current version's chunk count (an Excluded document's chunks
+    # are parked in the archive, so the live count above is 0 for it).
+    previous_counts = (
+        db.query(
+            DocumentVersion.DocumentId.label("document_id"),
+            func.count(DocumentVersion.Id).label("previous_versions"),
+        )
+        .filter(DocumentVersion.Status == doc_history.PREVIOUS)
+        .group_by(DocumentVersion.DocumentId)
+        .subquery()
+    )
+    latest_chunks = (
+        db.query(
+            DocumentVersion.DocumentId.label("document_id"),
+            func.max(DocumentVersion.ChunkCount).label("latest_chunks"),
+        )
+        .filter(DocumentVersion.Status == doc_history.LATEST)
+        .group_by(DocumentVersion.DocumentId)
+        .subquery()
+    )
+    updater = aliased(User)
+
     rows = (
         db.query(
             Document,
             User.DisplayName,
             func.coalesce(chunk_counts.c.chunk_count, 0).label("chunk_count"),
+            updater.DisplayName,
+            func.coalesce(previous_counts.c.previous_versions, 0),
+            latest_chunks.c.latest_chunks,
         )
         .join(User, User.Id == Document.UploadedBy)
+        .outerjoin(updater, updater.Id == Document.UpdatedBy)
         .outerjoin(chunk_counts, chunk_counts.c.document_id == Document.Id)
+        .outerjoin(previous_counts, previous_counts.c.document_id == Document.Id)
+        .outerjoin(latest_chunks, latest_chunks.c.document_id == Document.Id)
         # Active and Excluded documents -- Deleted ones are listed by GET /deleted
         .filter(Document.Status.in_((doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED)))
         .order_by(Document.UploadedAt.desc())
@@ -223,12 +230,17 @@ def list_documents(
             source_type=doc.SourceType,
             uploaded_by=display_name,
             uploaded_at=doc.UploadedAt,
-            chunk_count=chunk_count,
+            chunk_count=(
+                (latest or 0) if doc.Status == doc_history.DOC_EXCLUDED else chunk_count
+            ),
             version=doc.Version,
             status=doc.Status,
             source_path=doc.SourcePath,
+            updated_at=doc.UpdatedAt or doc.UploadedAt,
+            updated_by=updated_by or display_name,
+            previous_versions=previous,
         )
-        for doc, display_name, chunk_count in rows
+        for doc, display_name, chunk_count, updated_by, previous, latest in rows
     ]
 
 
@@ -350,3 +362,68 @@ def include_document(
     return DocumentExcludeResponse(
         id=doc.Id, filename=doc.FileName, status=doc.Status, chunk_count=result["chunk_count"]
     )
+
+
+# --- Background jobs: progress of uploads and syncs ---------------------------
+
+
+@router.get("/jobs", response_model=list[JobOut])
+def list_jobs(
+    kind: Optional[str] = None,
+    active: bool = False,
+    connection_id: Optional[int] = None,
+    ids: Optional[str] = None,
+    mine: bool = False,
+    since_hours: Optional[int] = None,
+    limit: int = 20,
+    items: bool = True,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Jobs, newest first. kind='upload'|'sync'; active=true for queued/running
+    only; ids=1,2,3 for specific jobs; mine=true for the caller's own;
+    items=false to leave out the per-file rows.
+    """
+    id_list = None
+    if ids:
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ids must be a comma-separated list of numbers.")
+    return jobs.list_jobs(
+        db,
+        kind=kind,
+        active_only=active,
+        connection_id=connection_id,
+        ids=id_list,
+        started_by=user.Id if mine else None,
+        since_hours=since_hours,
+        limit=limit,
+        with_items=items,
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobOut)
+def get_job(
+    job_id: int,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.db.models import IngestionJob
+
+    job = db.get(IngestionJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return jobs.job_dict(db, job)
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=JobOut)
+def cancel_job(
+    job_id: int,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Files not started yet are skipped; the ones in progress finish normally."""
+    job = jobs.request_cancel(db, job_id)
+    return jobs.job_dict(db, job, with_items=False)

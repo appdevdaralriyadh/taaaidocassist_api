@@ -179,6 +179,11 @@ class DocumentListItem(BaseModel):
     status: str = "Active"
     # cloud documents: the file's path within the connected folder
     source_path: Optional[str] = None
+    # when the content (or name) last changed, and by whom
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    # earlier versions still restorable from History
+    previous_versions: int = 0
 
 
 class DocumentExcludeResponse(BaseModel):
@@ -300,6 +305,70 @@ class SourceConnectionItem(BaseModel):
 class ConnectResponse(BaseModel):
     connection: SourceConnectionItem
     sync: SyncResponse
+
+
+class ConnectStartResponse(BaseModel):
+    # The connection is saved; its first sync runs in the background
+    connection: SourceConnectionItem
+    job_id: int
+
+
+class SyncStartResponse(BaseModel):
+    connection_id: int
+    job_id: int
+
+
+# --- Background jobs (app/services/jobs.py) ---------------------------------
+
+
+class UploadQueuedResponse(BaseModel):
+    job_id: int
+    item_id: int
+    filename: str
+    status: str = "queued"
+
+
+class JobItemOut(BaseModel):
+    id: int
+    filename: str
+    source_path: Optional[str] = None
+    # 'queued' | 'checking' | 'downloading' | 'extracting' | 'embedding' |
+    # 'saving' | 'done'
+    step: str
+    progress_current: Optional[int] = None
+    progress_total: Optional[int] = None
+    outcome: Optional[str] = None
+    message: Optional[str] = None
+    # when done: uploads -> DocumentUploadResponse fields (or
+    # {outcome:'failed'|'cancelled', detail}); syncs -> {status, path, detail}
+    result: Optional[dict] = None
+
+
+class JobOut(BaseModel):
+    id: int
+    job_type: str  # 'upload' | 'sync'
+    # 'queued' | 'running' | 'cancel_requested' | 'completed' | 'partial' |
+    # 'failed' | 'cancelled' | 'interrupted'
+    status: str
+    connection_id: Optional[int] = None
+    total_items: int = 0
+    processed_items: int = 0
+    added: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    removed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    message: Optional[str] = None
+    started_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    # syncs: how many files ended in each result status
+    status_counts: Optional[dict] = None
+    # files being worked on right now (while the job runs)
+    current: list[JobItemOut] = Field(default_factory=list)
+    items: list[JobItemOut] = Field(default_factory=list)
 
 
 # --- Settings page (app/api/routes/settings.py) ------------------------------
