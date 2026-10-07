@@ -3,3 +3,13 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Logs, text files and SQL files are not committed...
+*.log
+*.txt
+*.sql
+# ...except the Python package lists, needed to install the API
+!requirements*.txt
+
+# Uploaded files waiting to be processed (app/services/jobs.py)
+upload_spool/

@@ -21,6 +21,13 @@ pandas>=2.2
 # --- Embeddings + similarity search ---
 numpy>=1.26
 sentence-transformers>=3.0        # local embeddings (no API key) -- see app/services/embeddings.py
+# BAAI/bge-m3 (app/config.py's EMBEDDING_MODEL) is XLM-RoBERTa-based, a
+# multilingual tokenizer family that needs SentencePiece -- unlike the
+# previous all-MiniLM-L6-v2 model (a WordPiece/BERT tokenizer), which
+# never needed this. Without it, loading the model raises an import
+# error from transformers about a missing SentencePiece tokenizer
+# backend, not something sentence-transformers alone pulls in.
+sentencepiece>=0.1.99
 langchain-text-splitters>=0.3     # chunking (RecursiveCharacterTextSplitter)
 
 # --- Anthropic Claude API ---
