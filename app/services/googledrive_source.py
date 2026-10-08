@@ -23,12 +23,27 @@ simply re-prompts sign-in (handled entirely in the frontend; this module
 just receives whatever token it's given and uses it as-is).
 
 Talks to the Drive API v3 directly over REST (the same style
-onedrive_source.py uses for Microsoft Graph) -- no Google SDK dependency
-needed at all for this token-based approach.
+onedrive_source.py uses for Microsoft Graph).
+
+Service account (when GOOGLE_SERVICE_ACCOUNT_FILE is set in .env): the
+app reads Drive as its own Google service account instead of the person's
+browser sign-in. Each folder is shared with the service account's email
+as Viewer, and the app gets its own short-lived tokens from the key file
+(google-auth, read-only Drive scope; cached and renewed automatically).
+That's what lets folders sync on a schedule with nobody signed in. The
+key file is only ever read here, at run time -- it is never stored in the
+database, sent to the browser, or logged.
+
+`access_token` below is either a token string (browser sign-in) or a
+function returning a current token (service account) -- the function is
+called for every request, so a long sync never runs on an expired token.
 """
 
+import json
 import re
-from typing import Optional
+import threading
+from pathlib import Path
+from typing import Callable, Optional, Union
 from urllib.parse import urlparse
 
 import requests
@@ -74,6 +89,91 @@ class GoogleDrivePathError(ValueError):
 
 class GoogleDriveConnectionError(RuntimeError):
     """The parsed folder couldn't be reached with the given access token."""
+
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+
+_DRIVE_READONLY = "https://www.googleapis.com/auth/drive.readonly"
+_sa_lock = threading.Lock()
+_sa_credentials = None
+_sa_email: Optional[str] = None
+
+TokenSource = Union[str, Callable[[], str]]
+
+
+def service_account_configured() -> bool:
+    """True when GOOGLE_SERVICE_ACCOUNT_FILE is set (whether or not the file is usable)."""
+    return bool((settings.GOOGLE_SERVICE_ACCOUNT_FILE or "").strip())
+
+
+def _key_path() -> Path:
+    return Path(settings.GOOGLE_SERVICE_ACCOUNT_FILE.strip().strip('"'))
+
+
+def service_account_email() -> Optional[str]:
+    """The email folders must be shared with, or None when not configured / unreadable."""
+    global _sa_email
+    if not service_account_configured():
+        return None
+    if _sa_email is None:
+        try:
+            with open(_key_path(), encoding="utf-8") as fh:
+                _sa_email = json.load(fh).get("client_email") or None
+        except (OSError, ValueError):
+            return None
+    return _sa_email
+
+
+def service_account_token() -> str:
+    """A current access token for the service account (cached, renewed shortly before expiry)."""
+    global _sa_credentials
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2 import service_account
+    except ImportError as exc:  # pragma: no cover -- depends on the install
+        raise GoogleDriveConnectionError(
+            "The Google service account needs the 'google-auth' package -- run "
+            "'pip install google-auth' on the API server and restart it."
+        ) from exc
+    with _sa_lock:
+        if _sa_credentials is None:
+            path = _key_path()
+            if not path.is_file():
+                raise GoogleDriveConnectionError(
+                    "The Google service account key file wasn't found at the path in "
+                    "GOOGLE_SERVICE_ACCOUNT_FILE (.env). Check the path and restart the API."
+                )
+            try:
+                _sa_credentials = service_account.Credentials.from_service_account_file(
+                    str(path), scopes=[_DRIVE_READONLY]
+                )
+            except (OSError, ValueError) as exc:
+                raise GoogleDriveConnectionError(
+                    "The Google service account key file couldn't be read -- make sure "
+                    "GOOGLE_SERVICE_ACCOUNT_FILE points to the JSON key downloaded from Google "
+                    "Cloud Console."
+                ) from exc
+        if not _sa_credentials.valid:
+            try:
+                _sa_credentials.refresh(Request())
+            except Exception as exc:  # noqa: BLE001 -- google.auth.exceptions.*, network errors
+                raise GoogleDriveConnectionError(
+                    "Google didn't accept the app's service account sign-in -- the key may have "
+                    "been deleted or disabled in Google Cloud Console, or this server can't reach "
+                    f"Google ({str(exc)[:200]})."
+                ) from exc
+        return _sa_credentials.token
+
+
+def _share_hint() -> str:
+    email = service_account_email()
+    who = email or "the app's Google service account"
+    return (
+        f"In Google Drive, share the folder with {who} as Viewer (Share > add that email > "
+        "Viewer), then try again."
+    )
 
 
 def parse_drive_path(raw: str) -> str:
@@ -129,8 +229,9 @@ def parse_drive_path(raw: str) -> str:
     return text
 
 
-def _headers(access_token: str) -> dict:
-    return {"Authorization": f"Bearer {access_token}"}
+def _headers(access_token: TokenSource) -> dict:
+    token = access_token() if callable(access_token) else access_token
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _google_error_reason(resp: requests.Response) -> Optional[str]:
@@ -153,7 +254,32 @@ def _google_error_reason(resp: requests.Response) -> Optional[str]:
     return error.get("status") or error.get("message")
 
 
-def _raise_for_response(resp: requests.Response, action: str) -> None:
+def _raise_for_response(resp: requests.Response, action: str, *, as_service: bool = False) -> None:
+    if as_service and resp.status_code in (401, 403, 404):
+        reason = _google_error_reason(resp)
+        if resp.status_code == 403 and reason == "accessNotConfigured":
+            raise GoogleDriveConnectionError(
+                f"Access denied while {action} -- Google says the Drive API isn't enabled for the "
+                "service account's Google Cloud project. In Google Cloud Console, open 'APIs & "
+                "Services' > 'Library', search for 'Google Drive API', and click Enable."
+            )
+        if resp.status_code == 401:
+            raise GoogleDriveConnectionError(
+                f"Google didn't accept the app's service account while {action} -- the key may "
+                "have been deleted or disabled in Google Cloud Console."
+            )
+        if resp.status_code == 403:
+            raise GoogleDriveConnectionError(
+                f"The app's Google account isn't allowed to read this while {action}"
+                + (f" (Google said: {reason})" if reason else "")
+                + ". "
+                + _share_hint()
+            )
+        raise GoogleDriveConnectionError(
+            f"Google Drive couldn't find this folder for the app while {action} -- it isn't "
+            "shared with the app's Google account yet, or it was deleted or moved. "
+            + _share_hint()
+        )
     if resp.status_code == 401:
         # A stale/expired browser-acquired token -- distinct from 403
         # (a genuinely valid sign-in that just lacks access to this
@@ -201,7 +327,7 @@ def _raise_for_response(resp: requests.Response, action: str) -> None:
         )
 
 
-def resolve_folder(access_token: str, folder_id: str) -> dict:
+def resolve_folder(access_token: TokenSource, folder_id: str) -> dict:
     """
     Confirms `folder_id` exists, is reachable with this access token, and
     is actually a folder. Raises GoogleDriveConnectionError with a clean
@@ -215,14 +341,14 @@ def resolve_folder(access_token: str, folder_id: str) -> dict:
         params={"fields": "id,name,mimeType", "supportsAllDrives": "true"},
         timeout=30,
     )
-    _raise_for_response(resp, "resolving the folder")
+    _raise_for_response(resp, "resolving the folder", as_service=callable(access_token))
     item = resp.json()
     if item.get("mimeType") != "application/vnd.google-apps.folder":
         raise GoogleDriveConnectionError("That ID points to a file, not a folder.")
     return item
 
 
-def _list_children(access_token: str, folder_id: str) -> list[dict]:
+def _list_children(access_token: TokenSource, folder_id: str) -> list[dict]:
     children: list[dict] = []
     params = {
         "q": f"'{folder_id}' in parents and trashed = false",
@@ -238,7 +364,7 @@ def _list_children(access_token: str, folder_id: str) -> list[dict]:
         resp = requests.get(
             f"{_DRIVE_API}/files", headers=_headers(access_token), params=params, timeout=30
         )
-        _raise_for_response(resp, "listing folder contents")
+        _raise_for_response(resp, "listing folder contents", as_service=callable(access_token))
         body = resp.json()
         children.extend(body.get("files", []))
         page_token = body.get("nextPageToken")
@@ -254,7 +380,7 @@ def _extension(name: str) -> str:
 
 
 def list_target_files(
-    access_token: str, folder_id: str, base_path: str, on_progress=None
+    access_token: TokenSource, folder_id: str, base_path: str, on_progress=None
 ) -> tuple[list[dict], list[tuple[str, str, str]]]:
     """
     Recursively walks the folder (Drive has no single-call recursive
@@ -344,7 +470,7 @@ def list_target_files(
     return target_files, skipped
 
 
-def fetch_file_content(access_token: str, entry: dict) -> bytes:
+def fetch_file_content(access_token: TokenSource, entry: dict) -> bytes:
     """
     Downloads a regular file directly, or exports a native Google Docs/
     Sheets file to the format chosen in _EXPORT_MIME_TYPES. `entry` is one
@@ -367,5 +493,5 @@ def fetch_file_content(access_token: str, entry: dict) -> bytes:
             params={"alt": "media", "supportsAllDrives": "true"},
             timeout=60,
         )
-    _raise_for_response(resp, "downloading a file")
+    _raise_for_response(resp, "downloading a file", as_service=callable(access_token))
     return resp.content

@@ -31,9 +31,11 @@ supported file in the folder:
     the first sync; extra copies are set aside in the Deleted tab.
 
 Then every document of this connection whose file is no longer in the
-folder is permanently deleted ("removed"). Safety: if the folder lists no
-files at all, nothing is removed (an empty listing is more likely an
-access problem than a deliberate wipe).
+folder is removed ("removed"): permanently deleted on a manual Sync Now,
+moved to the Library's Deleted tab on an automatic (scheduled) sync, so
+nothing disappears for good without a person seeing it. Safety: if the
+folder lists no files at all, nothing is removed (an empty listing is more
+likely an access problem than a deliberate wipe).
 
 Each file is committed on its own, so one bad file never undoes the rest,
 and every sync is recorded as an IngestionJob (JobType 'sync') with one
@@ -44,7 +46,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from fastapi import HTTPException, status
@@ -52,7 +54,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.models import Document, IngestionJob, IngestionJobItem, SourceConnection, User
-from app.services import app_settings, doc_history
+from app.services import app_settings, doc_history, googledrive_source, onedrive_auth, onedrive_source
 from app.services.doc_matching import doc_year, text_shingles
 from app.services.embeddings import embed_texts
 from app.services.ingestion import (
@@ -64,6 +66,11 @@ from app.services.ingestion import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Automatic sync choices (hours; 0 = off) -- stored per connection in
+# ConfigJson "schedule_hours", so no database change is needed.
+SCHEDULE_OPTIONS = (0, 1, 6, 12, 24)
+AUTOMATIC_PREFIX = "Automatic sync -- "
 
 SOURCE_LABELS = {"onedrive": "OneDrive", "googledrive": "Google Drive", "upload": "an upload"}
 
@@ -98,6 +105,7 @@ class FileResult:
     previous_version: Optional[int] = None
     new_version: Optional[int] = None
     chunk_count: Optional[int] = None
+    outcome: Optional[str] = None  # overrides _OUTCOMES[status] for the job item
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -477,7 +485,7 @@ def fill_item(item: IngestionJobItem, res: FileResult) -> None:
     if res.external_id:
         item.ExternalId = res.external_id
     item.Step = "done"
-    item.Outcome = _OUTCOMES[res.status]
+    item.Outcome = res.outcome or _OUTCOMES[res.status]
     related = res.status in ("duplicate", "older_version")
     item.DocumentId = None if related else res.document_id
     item.RelatedDocumentId = res.document_id if related else None
@@ -624,11 +632,14 @@ def remove_missing(
     source_type: str,
     listed: set,
     on_result: Callable[[FileResult], None],
+    soft: bool = False,
 ) -> list[FileResult]:
     """
-    Permanently deletes this connection's documents whose file is no longer
-    in the folder (committing each). Safety: nothing is removed when the
-    folder listed no files at all.
+    Removes this connection's documents whose file is no longer in the
+    folder (committing each): permanently, or -- soft=True, automatic
+    syncs -- by moving them to the Deleted tab (restorable until the
+    retention period ends). Safety: nothing is removed when the folder
+    listed no files at all.
     """
     label = SOURCE_LABELS.get(source_type, source_type)
     gone = (
@@ -654,13 +665,28 @@ def remove_missing(
     for doc in gone:
         path = doc.SourcePath or doc.FileName
         try:
-            chunks = doc_history.purge_document(
-                db, doc, by_user_id=user.Id, reason=f"Removed from the {label} folder."
-            )
-            res = FileResult(
-                path, "removed", f"No longer in the {label} folder -- permanently deleted.",
-                document_id=doc.Id, chunk_count=chunks,
-            )
+            if soft:
+                was_excluded = doc.Status == doc_history.DOC_EXCLUDED
+                version = doc_history.soft_delete(
+                    db, doc, by_user_id=user.Id, allow_excluded=True,
+                    reason=f"Removed from the {label} folder (automatic sync).",
+                )
+                res = FileResult(
+                    path, "removed",
+                    f"No longer in the {label} folder -- moved to the Library's Deleted tab "
+                    "(restore it there if this was a mistake).",
+                    document_id=doc.Id,
+                    chunk_count=None if was_excluded else version.ChunkCount,
+                    outcome="moved_to_deleted",
+                )
+            else:
+                chunks = doc_history.purge_document(
+                    db, doc, by_user_id=user.Id, reason=f"Removed from the {label} folder."
+                )
+                res = FileResult(
+                    path, "removed", f"No longer in the {label} folder -- permanently deleted.",
+                    document_id=doc.Id, chunk_count=chunks,
+                )
             on_result(res)
             db.commit()
         except Exception as exc:  # noqa: BLE001
@@ -677,6 +703,7 @@ def finish_sync_job(
     connection: SourceConnection,
     results: list[FileResult],
     cancelled: bool = False,
+    automatic: bool = False,
 ) -> None:
     """Totals, final status and the connection's last-sync fields. Commits."""
     label = SOURCE_LABELS.get(connection.SourceType, connection.SourceType)
@@ -694,7 +721,8 @@ def finish_sync_job(
     else:
         job.Status = "failed" if counts["failed"] and not ok else ("partial" if counts["failed"] else "completed")
     job.Message = (
-        ("Cancelled. " if cancelled else "")
+        (AUTOMATIC_PREFIX if automatic else "")
+        + ("Cancelled. " if cancelled else "")
         + f"Synced {label} '{connection.DisplayLabel}': "
         + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in counts.items() if n)
     )[:1000]
@@ -779,6 +807,212 @@ def run_sync(
     )
     finish_sync_job(db, job=db.get(IngestionJob, job_id), connection=connection, results=results)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Reaching the cloud folder, and automatic syncs
+# ---------------------------------------------------------------------------
+
+
+class SourceAccessError(ValueError):
+    """The connection can't be reached the way it was asked (e.g. no sign-in token)."""
+
+
+def google_auth_mode() -> str:
+    return "service_account" if googledrive_source.service_account_configured() else "browser"
+
+
+def auth_mode(connection: SourceConnection) -> str:
+    return google_auth_mode() if connection.SourceType == "googledrive" else "microsoft"
+
+
+def schedule_allowed(connection: SourceConnection) -> bool:
+    """
+    Whether this folder can have an automatic-sync setting at all: Google
+    Drive with the service account, or OneDrive with a stored permission
+    (onedrive_auth) -- even while that one is waiting for Reconnect.
+    """
+    if connection.SourceType == "googledrive":
+        return google_auth_mode() == "service_account"
+    if connection.SourceType == "onedrive":
+        return onedrive_auth.available() and onedrive_auth.has_permission(connection)
+    return False
+
+
+def can_run_unattended(connection: SourceConnection) -> bool:
+    """True when the app can sync this folder right now with nobody signed in."""
+    if connection.SourceType == "onedrive":
+        return schedule_allowed(connection) and not onedrive_auth.needs_reconnect(connection)
+    return schedule_allowed(connection)
+
+
+def source_functions(connection: SourceConnection, access_token: Optional[str] = None):
+    """
+    (list_fn, fetch_fn) for one connection. Google Drive with a service
+    account needs no token (a fresh one is fetched for every request);
+    otherwise `access_token` -- the person's browser sign-in -- is required.
+    """
+    config = json.loads(connection.ConfigJson)
+    if connection.SourceType == "googledrive":
+        if can_run_unattended(connection):
+            token = googledrive_source.service_account_token
+        elif access_token:
+            token = access_token
+        else:
+            raise SourceAccessError(
+                "Your Google sign-in for this folder is missing -- click Sync Now again and "
+                "sign in when asked."
+            )
+
+        def list_fn(on_progress=None):
+            return googledrive_source.list_target_files(
+                token, config["folder_id"], config["path"], on_progress=on_progress
+            )
+
+        def fetch_fn(entry: dict) -> bytes:
+            return googledrive_source.fetch_file_content(token, entry)
+
+        return list_fn, fetch_fn
+    if connection.SourceType == "onedrive":
+        if access_token:
+            token = access_token  # the person's browser sign-in (Sync Now)
+        elif can_run_unattended(connection):
+            token = onedrive_auth.token_provider(connection.Id)  # automatic sync
+        elif onedrive_auth.needs_reconnect(connection):
+            raise SourceAccessError(
+                onedrive_auth.reconnect_reason(connection)
+                or "This folder's automatic sync needs Reconnect on the OneDrive page."
+            )
+        else:
+            raise SourceAccessError(
+                "Your sign-in for this folder is missing -- click Sync Now again and sign in "
+                "when asked."
+            )
+
+        def list_fn(on_progress=None):
+            return onedrive_source.list_target_files(
+                token, config["drive_id"], config["item_id"], config["path"],
+                on_progress=on_progress,
+            )
+
+        def fetch_fn(entry: dict) -> bytes:
+            return onedrive_source.fetch_file_content(
+                token, config["drive_id"], entry["item_id"]
+            )
+
+        return list_fn, fetch_fn
+    raise SourceAccessError(f"Unknown source type '{connection.SourceType}'.")
+
+
+def schedule_hours(connection: SourceConnection) -> int:
+    """The connection's automatic-sync interval in hours (0 = off, or not possible)."""
+    if not schedule_allowed(connection):
+        return 0
+    try:
+        hours = int(json.loads(connection.ConfigJson).get("schedule_hours") or 0)
+    except (ValueError, TypeError):
+        return 0
+    return hours if hours in SCHEDULE_OPTIONS else 0
+
+
+def set_schedule_hours(connection: SourceConnection, hours: int) -> None:
+    """Saves the interval in ConfigJson. Does not commit."""
+    config = json.loads(connection.ConfigJson)
+    if hours:
+        config["schedule_hours"] = hours
+    else:
+        config.pop("schedule_hours", None)
+    connection.ConfigJson = json.dumps(config)
+
+
+def next_sync_at(db: Session, connection: SourceConnection) -> Optional[datetime]:
+    """
+    When the next automatic sync is due (UTC), or None when it's off.
+    Counted from the later of the last finished sync and the last sync
+    started (manual or automatic), so a sync that keeps failing waits a
+    full interval before the next try instead of retrying every minute.
+    """
+    hours = schedule_hours(connection)
+    if not hours or not can_run_unattended(connection):
+        return None  # off, or paused (OneDrive waiting for Reconnect)
+    last_started = (
+        db.query(func.max(IngestionJob.CreatedAt))
+        .filter(IngestionJob.JobType == "sync", IngestionJob.ConnectionId == connection.Id)
+        .scalar()
+    )
+    marks = [t for t in (connection.LastSyncedAt, last_started) if t is not None]
+    if not marks:
+        return datetime.utcnow()
+    return max(marks) + timedelta(hours=hours)
+
+
+def connection_document_count(db: Session, connection: SourceConnection) -> int:
+    """Documents in the Library (active or excluded) that came from this folder."""
+    return (
+        db.query(func.count(Document.Id))
+        .filter(
+            Document.ConnectionId == connection.Id,
+            Document.Status.in_((doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED)),
+        )
+        .scalar()
+        or 0
+    )
+
+
+def remove_connection(db: Session, *, connection: SourceConnection, user: User, documents: str) -> dict:
+    """
+    Stops syncing a folder and deletes the connection. documents='keep':
+    its documents stay in the Library as ordinary documents (still used by
+    the chat); documents='delete': its active/excluded documents move to
+    the Deleted tab (restorable until the retention period ends). Either
+    way they're unlinked from the folder -- if the same folder is connected
+    again later, kept documents are matched up by path instead of being
+    added twice. Past sync jobs stay in the history. Commits.
+    """
+    if documents not in ("keep", "delete"):
+        raise HTTPException(status_code=400, detail="Choose whether to keep or delete the folder's documents.")
+    active = (
+        db.query(IngestionJob.Id)
+        .filter(
+            IngestionJob.JobType == "sync",
+            IngestionJob.ConnectionId == connection.Id,
+            IngestionJob.Status.in_(("queued", "running", "cancel_requested")),
+        )
+        .first()
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This folder is syncing right now -- cancel the sync (or wait for it to finish), then remove it.",
+        )
+    label = connection.DisplayLabel
+    source = SOURCE_LABELS.get(connection.SourceType, connection.SourceType)
+    docs = db.query(Document).filter(Document.ConnectionId == connection.Id).all()
+    kept = moved = 0
+    for doc in docs:
+        if doc.Status in (doc_history.DOC_ACTIVE, doc_history.DOC_EXCLUDED):
+            if documents == "delete":
+                doc_history.soft_delete(
+                    db, doc, by_user_id=user.Id, allow_excluded=True,
+                    reason=f"The {source} folder '{label}' was removed from sync.",
+                )
+                moved += 1
+            else:
+                kept += 1
+        doc.ConnectionId = None
+        doc.ExternalId = None
+        doc.SourceVersionTag = None
+    db.query(IngestionJob).filter(IngestionJob.ConnectionId == connection.Id).update(
+        {IngestionJob.ConnectionId: None}, synchronize_session=False
+    )
+    db.flush()
+    db.delete(connection)
+    db.commit()
+    logger.info(
+        "Connection '%s' removed by user %s: %s document(s) kept, %s moved to Deleted",
+        label, user.Id, kept, moved,
+    )
+    return {"label": label, "documents_kept": kept, "documents_moved_to_deleted": moved}
 
 
 def summarize(results: list[FileResult]) -> dict:

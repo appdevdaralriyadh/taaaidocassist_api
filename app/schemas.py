@@ -242,26 +242,70 @@ class GoogleDriveConnectRequest(BaseModel):
     # Identity Services right before this call (see
     # googledrive.component.ts) -- never persisted server-side, same
     # pattern OneDriveConnectRequest.access_token already uses for
-    # Microsoft Graph.
-    access_token: str
+    # Microsoft Graph. Not needed (and ignored) when the API reads Drive
+    # through its service account (GOOGLE_SERVICE_ACCOUNT_FILE).
+    access_token: Optional[str] = None
     folder_path: str  # pasted Google Drive folder link, or a bare folder ID
     display_label: Optional[str] = None
+    # automatic sync from the start (service account only): 0/1/6/12/24 hours
+    schedule_hours: int = 0
 
 
 class OneDriveConnectRequest(BaseModel):
     access_token: str  # short-lived Microsoft Graph token from the frontend's MSAL session
     shared_link: str  # pasted OneDrive/SharePoint shared-folder link
     display_label: Optional[str] = None
+    # automatic sync from the start: 0/1/6/12/24 hours. Needs api_token --
+    # a token Entra issued for this app itself (OneDriveInfo.api_scope) --
+    # so the API can keep a renewable permission (app/services/onedrive_auth.py).
+    schedule_hours: int = 0
+    api_token: Optional[str] = None
 
 
 class SyncRequest(BaseModel):
-    # Required for both onedrive and googledrive connections -- a fresh
-    # token, re-acquired by the frontend right before the call, for
-    # whichever provider the connection belongs to. Optional at the
-    # schema level only because this one request type is shared between
-    # source types; app/api/routes/sources.py enforces it's actually
-    # present for both.
+    # A fresh token, re-acquired by the frontend right before the call,
+    # for whichever provider the connection belongs to. Required for
+    # OneDrive, and for Google Drive only when no service account is set
+    # up -- app/api/routes/sources.py checks it.
     access_token: Optional[str] = None
+
+
+class ScheduleRequest(BaseModel):
+    # 0 = off; otherwise one of 1, 6, 12, 24 hours
+    every_hours: int
+    # OneDrive: a token for this app itself, so the API can keep a renewable
+    # permission for you (you become the folder's automatic sync account)
+    api_token: Optional[str] = None
+
+
+class ApiTokenRequest(BaseModel):
+    # a token Entra issued for this app itself (OneDriveInfo.api_scope)
+    api_token: str
+
+
+class OneDriveInfo(BaseModel):
+    automatic_available: bool
+    # why automatic sync isn't available (setup missing), when it isn't
+    problem: Optional[str] = None
+    # what the page asks Entra for to get api_token
+    api_scope: Optional[str] = None
+    schedule_options: list[int] = []
+
+
+class RenewResponse(BaseModel):
+    renewed: int
+    # folders whose permission couldn't be renewed, with the reason
+    failed: list[str] = []
+
+
+class GoogleDriveInfo(BaseModel):
+    # 'service_account' (no sign-in popup; folders shared with
+    # service_account_email) or 'browser' (each person's Google sign-in)
+    auth_mode: str
+    service_account_email: Optional[str] = None
+    # set when a key file is configured but can't be used
+    problem: Optional[str] = None
+    schedule_options: list[int] = []
 
 
 class SyncFileResult(BaseModel):
@@ -300,6 +344,27 @@ class SourceConnectionItem(BaseModel):
     last_synced_at: Optional[datetime] = None
     last_sync_status: Optional[str] = None
     last_sync_error: Optional[str] = None
+    # Automatic sync: 0 = off; every N hours otherwise (Google Drive with the
+    # service account, or OneDrive with a stored permission). next_sync_at is
+    # when the next one is due (None while off or paused).
+    schedule_hours: int = 0
+    next_sync_at: Optional[datetime] = None
+    # OneDrive: whose sign-in automatic syncs use, and whether Microsoft
+    # wants that sign-in renewed (automatic sync paused until Reconnect)
+    auto_sync_account: Optional[str] = None
+    needs_reconnect: bool = False
+    reconnect_reason: Optional[str] = None
+    # 'service_account' | 'browser' (Google Drive) | 'microsoft' (OneDrive)
+    auth_mode: Optional[str] = None
+    # documents in the Library (active or excluded) that came from this folder
+    document_count: int = 0
+
+
+class ConnectionRemovedResponse(BaseModel):
+    connection_id: int
+    label: str
+    documents_kept: int
+    documents_moved_to_deleted: int
 
 
 class ConnectResponse(BaseModel):
@@ -361,6 +426,8 @@ class JobOut(BaseModel):
     failed: int = 0
     message: Optional[str] = None
     started_by: Optional[str] = None
+    # an automatic (scheduled) sync rather than a person's Sync Now
+    automatic: bool = False
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

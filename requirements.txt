@@ -34,9 +34,13 @@ langchain-text-splitters>=0.3     # chunking (RecursiveCharacterTextSplitter)
 anthropic>=0.34
 
 # --- OneDrive / Microsoft Graph / Google Drive ---
-# Both connectors authenticate with a frontend-supplied access token and
-# talk to their REST APIs directly -- no provider SDK needed for either.
+# Both connectors talk to their REST APIs directly. OneDrive (and Google
+# Drive without a service account) use a frontend-supplied access token.
 requests>=2.31
+# Google Drive through the app's service account (GOOGLE_SERVICE_ACCOUNT_FILE):
+# turns the JSON key into short-lived Drive tokens -- see
+# app/services/googledrive_source.py
+google-auth>=2.29
 
 # --- Config / environment ---
 python-dotenv>=1.0

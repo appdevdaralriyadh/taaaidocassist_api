@@ -219,5 +219,30 @@ class Settings(BaseSettings):
     # "upload_spool" folder next to the app folder.
     UPLOAD_SPOOL_DIR: str = ""
 
+    # --- Google Drive through a service account (app/services/googledrive_source.py) ---
+    # Full path to the service account's JSON key file. When set, Google
+    # Drive folders are read as that account (share each folder with its
+    # email as Viewer): no Google sign-in popup, and folders can sync
+    # automatically on a schedule. Empty = the browser Google sign-in, as
+    # before. Keep the key file outside the project folder -- it is a
+    # password and must never be committed.
+    GOOGLE_SERVICE_ACCOUNT_FILE: str = ""
+
+    # --- OneDrive automatic sync (app/services/onedrive_auth.py) ---
+    # A client secret of the same Entra app registration (its Value, not
+    # its Secret ID). With it, the API can keep a renewable OneDrive
+    # permission for the person who turns automatic sync on for a folder.
+    # Empty = OneDrive stays manual (Sync Now), as before.
+    ENTRA_CLIENT_SECRET: str = ""
+    # Encrypts those stored permissions. Optional: when empty, a key is
+    # derived from JWT_SECRET_KEY. Changing it means folders need Reconnect.
+    # Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    TOKEN_ENCRYPTION_KEY: str = ""
+    # Only if the app registration has an "Expose an API" scope you'd
+    # rather use (e.g. api://<client id>/access_as_user); empty = the
+    # app's own "<client id>/.default".
+    ENTRA_API_SCOPE: str = ""
+
 
 settings = Settings()

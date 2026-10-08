@@ -214,12 +214,17 @@ def soft_delete(
     by_user_id: Optional[int],
     reason: str,
     merged_into_document_id: Optional[int] = None,
+    allow_excluded: bool = False,
 ) -> DocumentVersion:
     """
     Flags the document 'Deleted' and archives its content -- the row stays,
     and it can be restored until the retention period ends. Does not commit.
+    allow_excluded: an Excluded document may be moved too (its content is
+    already in the archive; restoring it brings it back as Active) -- used
+    by automatic syncs for files removed from the cloud folder.
     """
-    if doc.Status != DOC_ACTIVE:
+    allowed = (DOC_ACTIVE, DOC_EXCLUDED) if allow_excluded else (DOC_ACTIVE,)
+    if doc.Status not in allowed:
         raise HTTPException(status_code=409, detail=f"'{doc.FileName}' is already {doc.Status.lower()}.")
     version = archive_current(db, doc, new_status=DELETED, by_user_id=by_user_id)
     doc.Status = DOC_DELETED

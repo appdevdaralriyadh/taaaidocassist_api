@@ -29,6 +29,15 @@ sync can't resume -- it needs the person's short-lived Microsoft/Google
 sign-in -- so it's marked 'interrupted' and Sync Now simply runs again
 (unchanged files are skipped).
 
+Automatic syncs: Google Drive folders read through the service account
+(GOOGLE_SERVICE_ACCOUNT_FILE), and OneDrive folders with a stored
+permission (ENTRA_CLIENT_SECRET, app/services/onedrive_auth.py), can be
+set to sync every 1/6/12/24 hours.
+The upkeep thread starts the ones that are due (start_due_syncs). They run
+like Sync Now, as the person who connected the folder, except that files
+removed from the folder are moved to the Library's Deleted tab instead of
+being deleted for good, and their messages start with "Automatic sync".
+
 The upkeep thread keeps this process's waiting work "fresh" in the
 database (UpdatedAt) so that, should several API processes ever run side
 by side, one never takes over another's live work.
@@ -372,6 +381,7 @@ def start_sync(
     user: User,
     list_fn: Callable[[], tuple],
     fetch_fn: Callable[[dict], bytes],
+    automatic: bool = False,
 ) -> int:
     """Queues a sync of one connection and starts it. Returns the job id."""
     active = (
@@ -393,7 +403,7 @@ def start_sync(
         ConnectionId=connection.Id,
         Status="queued",
         StartedBy=user.Id,
-        Message="Waiting to start...",
+        Message=(cloud_sync.AUTOMATIC_PREFIX if automatic else "") + "Waiting to start...",
     )
     db.add(job)
     db.flush()
@@ -403,7 +413,7 @@ def start_sync(
         _mine_jobs.add(job_id)
     threading.Thread(
         target=_run_sync_job,
-        args=(job_id, connection.Id, user.Id, list_fn, fetch_fn),
+        args=(job_id, connection.Id, user.Id, list_fn, fetch_fn, automatic),
         name=f"sync-{job_id}",
         daemon=True,
     ).start()
@@ -500,8 +510,11 @@ def _run_sync_file(job_id: int, item_id: int, connection_id: int, user_id: int, 
         db.close()
 
 
-def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_fn) -> None:
+def _run_sync_job(
+    job_id: int, connection_id: int, user_id: int, list_fn, fetch_fn, automatic: bool = False
+) -> None:
     db = _session()
+    lead = cloud_sync.AUTOMATIC_PREFIX if automatic else ""
     try:
         job = db.get(IngestionJob, job_id)
         connection = db.get(SourceConnection, connection_id)
@@ -509,7 +522,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
         label = cloud_sync.SOURCE_LABELS.get(connection.SourceType, connection.SourceType)
         job.Status = "running"
         job.StartedAt = func.sysutcdatetime()
-        job.Message = f"Listing the files in the {label} folder..."
+        job.Message = f"{lead}Listing the files in the {label} folder..."
         db.commit()
 
         watch = _CancelWatch(job_id)
@@ -521,7 +534,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
                 last_note[0] = time.monotonic()
                 note = db.get(IngestionJob, job_id)
                 note.Message = (
-                    f"Listing the files in the {label} folder... {found} found so far "
+                    f"{lead}Listing the files in the {label} folder... {found} found so far "
                     f"({folders} folder{'s' if folders != 1 else ''} read)"
                 )
                 db.commit()
@@ -532,7 +545,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
             db.rollback()
             job = db.get(IngestionJob, job_id)
             job.Status = "cancelled"
-            job.Message = "Cancelled while listing the folder -- nothing was changed."
+            job.Message = f"{lead}Cancelled while listing the folder -- nothing was changed."
             job.FinishedAt = func.sysutcdatetime()
             connection = db.get(SourceConnection, connection_id)
             connection.LastSyncedAt = _now()
@@ -541,10 +554,10 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
             db.commit()
             return
         except Exception as exc:  # noqa: BLE001 -- e.g. folder gone, no access, sign-in expired
-            message = str(getattr(exc, "detail", None) or exc)[:1000]
+            message = str(getattr(exc, "detail", None) or exc)[:900]
             job = db.get(IngestionJob, job_id)
             job.Status = "failed"
-            job.Message = message
+            job.Message = f"{lead}{message}"
             job.FinishedAt = func.sysutcdatetime()
             connection.LastSyncedAt = _now()
             connection.LastSyncStatus = "error"
@@ -572,7 +585,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
         job = db.get(IngestionJob, job_id)
         job.TotalItems = len(target_files) + len(skipped)
         job.ProcessedItems = len(skipped)
-        job.Message = f"Syncing {len(target_files)} file(s) from {label}..."
+        job.Message = f"{lead}Syncing {len(target_files)} file(s) from {label}..."
         db.commit()
 
         futures = [
@@ -595,6 +608,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
                         source_type=connection.SourceType,
                         listed=listed,
                         on_result=lambda r: cloud_sync._add_item(db, job_id, r),
+                        soft=automatic,
                     )
                 )
         db.expire_all()
@@ -604,6 +618,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
             connection=db.get(SourceConnection, connection_id),
             results=results,
             cancelled=cancelled,
+            automatic=automatic,
         )
     except Exception as exc:  # noqa: BLE001
         db.rollback()
@@ -611,7 +626,7 @@ def _run_sync_job(job_id: int, connection_id: int, user_id: int, list_fn, fetch_
         try:
             job = db.get(IngestionJob, job_id)
             job.Status = "failed"
-            job.Message = f"The sync stopped unexpectedly: {str(exc)[:300]}"
+            job.Message = f"{lead}The sync stopped unexpectedly: {str(exc)[:300]}"
             job.FinishedAt = func.sysutcdatetime()
             db.commit()
         except Exception:  # noqa: BLE001
@@ -736,6 +751,45 @@ def _pick_up_left_work(db: Session) -> None:
         db.commit()
 
 
+def start_due_syncs(db: Session) -> list[int]:
+    """
+    Starts the automatic syncs that are due: Google Drive with the service
+    account, and OneDrive folders with a stored permission that isn't
+    waiting for Reconnect. Returns the new job ids.
+    """
+    from app.services import onedrive_auth
+
+    started = []
+    now = _now()
+    for connection in db.query(SourceConnection).all():
+        if not cloud_sync.schedule_hours(connection) or not cloud_sync.can_run_unattended(connection):
+            continue
+        due = cloud_sync.next_sync_at(db, connection)
+        if due is None or due > now:
+            continue
+        # OneDrive runs as the folder's automatic sync account (the person
+        # whose sign-in is stored); Google Drive as whoever connected it.
+        user = db.get(User, onedrive_auth.owner_user_id(connection) or connection.CreatedBy)
+        if user is None:
+            continue
+        try:
+            list_fn, fetch_fn = cloud_sync.source_functions(connection)
+            job_id = start_sync(
+                db, connection=connection, user=user, list_fn=list_fn, fetch_fn=fetch_fn,
+                automatic=True,
+            )
+        except HTTPException:  # already syncing -- try again next round
+            db.rollback()
+            continue
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("Couldn't start the automatic sync of connection %s", connection.Id)
+            continue
+        logger.info("Started automatic sync %s of connection %s", job_id, connection.Id)
+        started.append(job_id)
+    return started
+
+
 def _warm_up_model() -> None:
     """Loads the embedding model in the background at start-up, so the first
     upload or sync doesn't sit at "Creating embeddings 0 of N" while it loads."""
@@ -753,6 +807,7 @@ def _upkeep_loop() -> None:
         try:
             _keep_fresh(db)
             _pick_up_left_work(db)
+            start_due_syncs(db)
         except Exception:  # noqa: BLE001
             db.rollback()
             logger.exception("Background job upkeep failed")
@@ -841,6 +896,7 @@ def job_dict(db: Session, job: IngestionJob, *, with_items: bool = True) -> dict
         "failed": job.FailedCount,
         "message": job.Message,
         "started_by": starter.DisplayName if starter else None,
+        "automatic": (job.Message or "").startswith(cloud_sync.AUTOMATIC_PREFIX),
         "created_at": job.CreatedAt,
         "started_at": job.StartedAt,
         "finished_at": job.FinishedAt,

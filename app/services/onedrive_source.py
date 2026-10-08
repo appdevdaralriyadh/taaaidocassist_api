@@ -2,7 +2,7 @@
 OneDrive/SharePoint connector (spec §3.2, §8 item 4): paste a shared
 folder link. The frontend already holds a live MSAL session (the same
 Entra app registration used for login, spec §3.1), so it fetches a
-short-lived Microsoft Graph access token for the Files.Read scope and
+short-lived Microsoft Graph access token for the Files.Read.All scope and
 sends it along with the link on every call -- nothing OneDrive-specific
 is stored server-side except the resolved folder reference itself
 (drive_id/item_id/path), never a token. That's not a shortcut: a SPA
@@ -13,8 +13,11 @@ for OneDrive the way GitHub's PAT is persisted.
 graph.microsoft.com is unreachable from the sandbox this was built in
 (same block as huggingface.co/api.openai.com) -- this module is verified
 via mocked Graph responses against the real route/service code. A live
-Graph token and the Files.Read delegated permission added to the Entra
+Graph token and the Files.Read.All delegated permission added to the Entra
 app registration are both required before this works end to end.
+Files.Read.All (rather than Files.Read) is what lets a person connect a
+folder someone else shared with them, not only folders in their own
+OneDrive.
 """
 
 import base64
@@ -50,8 +53,11 @@ def _encode_share_id(shared_link: str) -> str:
     return "u!" + b64.rstrip("=")
 
 
-def _headers(access_token: str) -> dict:
-    return {"Authorization": f"Bearer {access_token}"}
+def _headers(access_token) -> dict:
+    # a token string (browser sign-in), or a function returning a current
+    # token (automatic sync -- app/services/onedrive_auth.py)
+    token = access_token() if callable(access_token) else access_token
+    return {"Authorization": f"Bearer {token}"}
 
 
 _LINK_HELP = (
@@ -110,7 +116,9 @@ def _raise_for_response(resp: requests.Response, action: str) -> None:
     if resp.status_code == 403:
         raise OneDriveConnectionError(
             f"Access denied while {action} -- your Microsoft account doesn't have access to "
-            "this folder. Ask the folder's owner to share it with you, then try again."
+            "this folder. Ask the folder's owner to share it with you, then try again. If it is "
+            "already shared with you, the app may not have permission to read shared files yet: "
+            "an admin needs to grant consent for 'Files.Read.All' on the app in Microsoft Entra."
         )
     if resp.status_code == 404:
         raise OneDriveConnectionError(f"Not found while {action} (404 from Microsoft Graph).")
