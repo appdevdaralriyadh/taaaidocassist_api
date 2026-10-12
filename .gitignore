@@ -13,3 +13,10 @@ venv/
 
 # Uploaded files waiting to be processed (app/services/jobs.py)
 upload_spool/
+
+# Secrets: service account keys and other credential files -- never commit
+Google Service Account/
+*service-account*.json
+documentassist-*.json
+*.pem
+*.p12

@@ -570,8 +570,21 @@ def _run_sync_job(
             res = cloud_sync.FileResult(path, "skipped", reason, external_id=external_id)
             results.append(res)
             cloud_sync._add_item(db, job_id, res)
-        queued = []
+        # Files skipped earlier as unreadable (no text) and unchanged since:
+        # skipped again without downloading them.
+        known_unreadable = cloud_sync.unreadable_map(db.get(SourceConnection, connection_id))
+        tags = {e.get("external_id"): e.get("version_tag") for e in target_files}
+        to_sync = []
         for entry in target_files:
+            eid, tag = entry.get("external_id"), entry.get("version_tag")
+            if eid and tag and known_unreadable.get(eid) == tag:
+                res = cloud_sync.unreadable_result(entry)
+                results.append(res)
+                cloud_sync._add_item(db, job_id, res)
+            else:
+                to_sync.append(entry)
+        queued = []
+        for entry in to_sync:
             item = IngestionJobItem(
                 JobId=job_id,
                 FileName=cloud_sync._file_name(entry["path"])[:255],
@@ -584,8 +597,8 @@ def _run_sync_job(
             queued.append((item.Id, entry))
         job = db.get(IngestionJob, job_id)
         job.TotalItems = len(target_files) + len(skipped)
-        job.ProcessedItems = len(skipped)
-        job.Message = f"{lead}Syncing {len(target_files)} file(s) from {label}..."
+        job.ProcessedItems = len(skipped) + (len(target_files) - len(to_sync))
+        job.Message = f"{lead}Syncing {len(to_sync)} file(s) from {label}..."
         db.commit()
 
         futures = [
@@ -612,10 +625,21 @@ def _run_sync_job(
                     )
                 )
         db.expire_all()
+        connection = db.get(SourceConnection, connection_id)
+        # remember unreadable files (by cloud ID + version) so later syncs
+        # don't download them again until they change
+        cloud_sync.set_unreadable_map(
+            connection,
+            {
+                r.external_id: tags[r.external_id]
+                for r in results
+                if getattr(r, "unreadable", False) and r.external_id and tags.get(r.external_id)
+            },
+        )
         cloud_sync.finish_sync_job(
             db,
             job=db.get(IngestionJob, job_id),
-            connection=db.get(SourceConnection, connection_id),
+            connection=connection,
             results=results,
             cancelled=cancelled,
             automatic=automatic,

@@ -106,6 +106,9 @@ class FileResult:
     new_version: Optional[int] = None
     chunk_count: Optional[int] = None
     outcome: Optional[str] = None  # overrides _OUTCOMES[status] for the job item
+    # no text to read (scanned / image-only) -- skipped, and not downloaded
+    # again until the file changes (see unreadable_map)
+    unreadable: bool = False
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -617,7 +620,47 @@ def process_entry(
     return res
 
 
+UNREADABLE_DETAIL = (
+    "No text to read -- it's a scanned or image-only file, so it can't be used in the chat. "
+    "To include it, save it as a text PDF (e.g. Adobe Acrobat: Scan & OCR > Recognize text); "
+    "the next sync picks up the new version."
+)
+
+
+def unreadable_result(entry: dict) -> FileResult:
+    return FileResult(
+        entry["path"], "skipped", UNREADABLE_DETAIL,
+        external_id=entry.get("external_id"), outcome="unreadable", unreadable=True,
+    )
+
+
+def _is_no_text(exc: Exception) -> bool:
+    return isinstance(exc, HTTPException) and "No extractable text found" in str(exc.detail)
+
+
+def unreadable_map(connection: SourceConnection) -> dict:
+    """{cloud file ID: version tag} of files skipped as unreadable on earlier syncs."""
+    try:
+        return dict(json.loads(connection.ConfigJson or "{}").get("unreadable") or {})
+    except (ValueError, TypeError):
+        return {}
+
+
+def set_unreadable_map(connection: SourceConnection, mapping: dict) -> None:
+    """Saves it in ConfigJson (no database change needed). Does not commit."""
+    config = json.loads(connection.ConfigJson or "{}")
+    if mapping:
+        config["unreadable"] = mapping
+    else:
+        config.pop("unreadable", None)
+    connection.ConfigJson = json.dumps(config)
+
+
 def failure_result(entry: dict, exc: Exception) -> FileResult:
+    if _is_no_text(exc):
+        # Not an error with the sync: the file has no text (scanned / image
+        # only). Shown as Skipped, so the folder doesn't turn "partial".
+        return unreadable_result(entry)
     detail = exc.detail if isinstance(exc, HTTPException) else (str(exc)[:300] or exc.__class__.__name__)
     if not isinstance(exc, HTTPException):
         logger.exception("Sync of %s failed", entry.get("path"))
