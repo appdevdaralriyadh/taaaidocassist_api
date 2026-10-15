@@ -29,9 +29,13 @@ sentence-transformers>=3.0        # local embeddings (no API key) -- see app/ser
 # backend, not something sentence-transformers alone pulls in.
 sentencepiece>=0.1.99
 langchain-text-splitters>=0.3     # chunking (RecursiveCharacterTextSplitter)
+# Voyage AI embeddings API (EMBEDDING_PROVIDER=voyage) -- see app/services/embeddings.py
+voyageai>=0.5
 
 # --- Anthropic Claude API ---
-anthropic>=0.34
+# Chat answers, and reading scanned PDF pages (OCR_ENABLED -- see
+# app/services/ocr.py). 0.49+ sends PDFs to Claude; tested up to 1.14.
+anthropic>=0.49
 
 # --- OneDrive / Microsoft Graph / Google Drive ---
 # Both connectors talk to their REST APIs directly. OneDrive (and Google

@@ -120,6 +120,58 @@ class Settings(BaseSettings):
         "Represent this sentence for searching relevant passages: "
     )
 
+    # --- Embedding provider (app/services/embeddings.py) ---
+    # "local" = the sentence-transformers model above, on this machine.
+    # "voyage" = the Voyage AI embeddings API: set EMBEDDING_MODEL to the
+    # Voyage model (e.g. voyage-3.5) and VOYAGE_API_KEY in .env. Vectors are
+    # requested at EMBEDDING_DIMENSIONS (1024), so no database change. The
+    # query prefix above is not used with Voyage (it uses input_type
+    # "query"/"document" instead). Switching provider or model needs Clear
+    # Knowledge Base + re-adding the documents, and re-tuning
+    # MAX_COSINE_DISTANCE / VERSION_CANDIDATE_MAX_DISTANCE (use
+    # GET /api/chat/debug-retrieval?q=...&max_distance=2 to see distances).
+    EMBEDDING_PROVIDER: str = "local"
+    VOYAGE_API_KEY: str = ""
+    # Retries on rate limits / temporary errors, and the per-call timeout
+    VOYAGE_MAX_RETRIES: int = 3
+    VOYAGE_TIMEOUT_SECONDS: float = 60
+
+    # --- Optional reranker (app/services/retrieval.py) ---
+    # Off while RERANK_MODEL is empty. Set it to a Voyage AI reranker
+    # (e.g. rerank-2.5 or rerank-2.5-lite; needs VOYAGE_API_KEY, works with
+    # either EMBEDDING_PROVIDER) and each chat question then: takes the
+    # RERANK_CANDIDATES closest chunks within MAX_COSINE_DISTANCE from SQL
+    # Server, has Voyage re-order them by how well they answer the question,
+    # and passes the best TOP_K_CHUNKS to Claude. Chunks scoring below
+    # RERANK_MIN_SCORE (0-1, higher = more relevant; 0 = keep all) are
+    # dropped -- if none are left the question is answered from general
+    # knowledge. If the reranker call fails, the plain distance order is
+    # used, so chat keeps working. No re-ingest needed to switch it on/off.
+    RERANK_MODEL: str = ""
+    RERANK_CANDIDATES: int = 20
+    RERANK_MIN_SCORE: float = 0.0
+
+    # --- Reading scanned / image-only PDF pages with Claude (app/services/ocr.py) ---
+    # Off by default. With OCR_ENABLED=true, PDF pages with fewer than
+    # OCR_MIN_CHARS_PER_PAGE characters of text are sent to Claude (the
+    # ANTHROPIC_API_KEY used for chat), which types out what is on them.
+    # The page images go to Anthropic. OCR_MODEL empty = ANTHROPIC_MODEL.
+    # Files with more than OCR_MAX_PAGES such pages are not read (cost cap)
+    # and stay Skipped. Turning this on makes the next sync retry files that
+    # were skipped as unreadable; uploaded files need uploading again.
+    OCR_ENABLED: bool = False
+    OCR_MODEL: str = ""
+    OCR_MAX_PAGES: int = 50
+    OCR_PAGES_PER_CALL: int = 10
+    OCR_MIN_CHARS_PER_PAGE: int = 50
+    # true = only English text is typed out (Arabic is skipped, which also
+    # saves tokens); false = all text in its original language
+    OCR_ENGLISH_ONLY: bool = True
+    # Room for Claude's answer per call; a group that runs out is split in two
+    OCR_MAX_OUTPUT_TOKENS: int = 16000
+    OCR_TIMEOUT_SECONDS: float = 300
+    OCR_MAX_RETRIES: int = 3
+
     # --- Upload limits (Phase 2, spec §7) ---
     MAX_UPLOAD_SIZE_MB: int = 25
 

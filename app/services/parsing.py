@@ -2,6 +2,9 @@
 Extracts plain text from an uploaded file's raw bytes, dispatching on file
 extension. Covers every source format spec §3.2 lists for local upload:
 PDF, DOCX, TXT, CSV, MD, XLSX.
+
+PDF pages with no stored text (scanned / image-only) are read with Claude
+when OCR_ENABLED is on -- see app/services/ocr.py.
 """
 
 import io
@@ -11,6 +14,8 @@ from docx import Document as DocxDocument
 from fastapi import HTTPException, status
 from pypdf import PdfReader
 
+from app.services import ocr
+
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".xlsx"}
 
 
@@ -18,7 +23,7 @@ def extract_text(filename: str, content: bytes) -> str:
     ext = _extension(filename)
 
     if ext == ".pdf":
-        return _extract_pdf(content)
+        return _extract_pdf(filename, content)
     if ext == ".docx":
         return _extract_docx(content)
     if ext in (".txt", ".md"):
@@ -41,9 +46,13 @@ def _extension(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 
-def _extract_pdf(content: bytes) -> str:
+def _extract_pdf(filename: str, content: bytes) -> str:
     reader = PdfReader(io.BytesIO(content))
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    pages = [page.extract_text() or "" for page in reader.pages]
+    if ocr.enabled():
+        # scanned / image-only pages are read with Claude; typed pages are kept as they are
+        pages = ocr.fill_image_pages(filename, content, pages)
+    return "\n\n".join(pages)
 
 
 def _extract_docx(content: bytes) -> str:

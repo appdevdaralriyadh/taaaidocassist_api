@@ -17,6 +17,12 @@ is gone, not kept alongside this one under the old name.
 The distance search itself *is* the query router: the caller (chat.py)
 treats "nothing cleared the cutoff" as the general-knowledge signal.
 There's no separate classifier call.
+
+Optional reranker (RERANK_MODEL in app/config.py, off by default): SQL
+Server returns the RERANK_CANDIDATES closest chunks within the cutoff,
+Voyage AI's reranker re-orders them by how well they answer the question,
+and the best TOP_K_CHUNKS (scoring at least RERANK_MIN_SCORE) are returned
+in that order. If the reranker fails, the distance order is used instead.
 """
 
 import logging
@@ -27,7 +33,15 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.services.embeddings import embed_query, to_vector_literal
+# embed_query raises EmbeddingServiceError when the provider (e.g. Voyage AI)
+# can't be reached -- callers turn that into a clear "search unavailable" message.
+from app.services.embeddings import (
+    EmbeddingServiceError,
+    embed_query,
+    rerank,
+    rerank_enabled,
+    to_vector_literal,
+)
 
 logger = logging.getLogger("darai.retrieval")
 
@@ -37,6 +51,9 @@ class RetrievedChunk:
     chunk_text: str
     filename: str
     distance: float  # cosine distance, LOWER is better -- see module docstring
+    # Voyage AI reranker relevance (0-1, HIGHER is better); None when the
+    # reranker is off or its call failed and the distance order was used.
+    rerank_score: Optional[float] = None
 
 
 # Wrapped in a derived table so VECTOR_DISTANCE is computed once per row,
@@ -99,9 +116,15 @@ def search(
     knowledge" signal the caller acts on, and this function doesn't
     distinguish between them (see the module-level comment on _SEARCH_SQL
     for how to tell them apart when debugging).
+
+    With the reranker on (RERANK_MODEL), more candidates are fetched and
+    the result is in reranker order (most relevant first) instead.
     """
     top_k = settings.TOP_K_CHUNKS if top_k is None else top_k
     max_distance = settings.MAX_COSINE_DISTANCE if max_distance is None else max_distance
+
+    use_reranker = rerank_enabled() and top_k > 0
+    fetch_k = max(settings.RERANK_CANDIDATES, top_k) if use_reranker else top_k
 
     query_vector = embed_query(query)
 
@@ -111,11 +134,11 @@ def search(
             "query_vec": to_vector_literal(query_vector),
             "embedding_model": settings.EMBEDDING_MODEL,
             "max_distance": max_distance,
-            "top_k": top_k,
+            "top_k": fetch_k,
         },
     ).mappings().all()
 
-    return [
+    candidates = [
         RetrievedChunk(
             chunk_text=row["ChunkText"],
             filename=row["FileName"],
@@ -123,3 +146,38 @@ def search(
         )
         for row in rows
     ]
+    if not use_reranker or not candidates:
+        return candidates[:top_k]
+    return _rerank(query, candidates, top_k)
+
+
+def _rerank(query: str, candidates: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
+    try:
+        ranked = rerank(query, [c.chunk_text for c in candidates], top_k)
+    except EmbeddingServiceError as exc:
+        # Chat keeps working on the plain distance order rather than failing.
+        logger.warning("Reranker unavailable, using distance order instead: %s", exc)
+        return candidates[:top_k]
+
+    min_score = settings.RERANK_MIN_SCORE
+    kept = []
+    for index, score in ranked:
+        if score < min_score:
+            continue
+        chunk = candidates[index]
+        kept.append(
+            RetrievedChunk(
+                chunk_text=chunk.chunk_text,
+                filename=chunk.filename,
+                distance=chunk.distance,
+                rerank_score=score,
+            )
+        )
+    logger.info(
+        "Reranked %d candidates: kept %d (min score %.2f, best %s)",
+        len(candidates),
+        len(kept),
+        min_score,
+        f"{ranked[0][1]:.3f}" if ranked else "n/a",
+    )
+    return kept[:top_k]

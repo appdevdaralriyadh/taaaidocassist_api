@@ -201,11 +201,16 @@ class DebugRetrievalChunk(BaseModel):
     # be misread as "higher is better" the way that field used to mean.
     distance: float
     chunk_text: str
+    # Voyage AI reranker relevance (0-1, HIGHER is better); null when the
+    # reranker is off (RERANK_MODEL empty) or its call failed.
+    rerank_score: Optional[float] = None
 
 
 class DebugRetrievalResponse(BaseModel):
     query: str
     max_distance: float
+    # The reranker model used for this search, or null when it's off.
+    rerank_model: Optional[str] = None
     matches: list[DebugRetrievalChunk]
 
 

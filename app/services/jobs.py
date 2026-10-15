@@ -60,7 +60,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db.models import IngestionJob, IngestionJobItem, SourceConnection, User
 from app.services import app_settings, cloud_sync
-from app.services.embeddings import embed_texts
+from app.services.embeddings import embed_texts, uses_local_model, warm_up
 from app.services.ingestion import (
     _extract_chunks,
     _record_failure,
@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = ("queued", "running", "cancel_requested")
 _EMBED_BATCH = 8  # chunks per embedding call -- also how often progress moves
+_EMBED_BATCH_API = 64  # same, with Voyage AI (EMBEDDING_PROVIDER=voyage)
 _CANCEL_CHECK_SECONDS = 2.0
 _STALE_AFTER = timedelta(seconds=90)
 _UPKEEP_SECONDS = 30
@@ -155,10 +156,13 @@ def embed_with_progress(chunks: list, report: Callable[[int, int], None]) -> lis
     `report` may raise JobCancelled to stop between batches."""
     total = len(chunks)
     report(0, total)
+    # Voyage AI: bigger batches (fewer API calls); the local model: small
+    # ones, so progress moves while the CPU works.
+    size = _EMBED_BATCH if uses_local_model() else _EMBED_BATCH_API
     vectors: list = []
-    for start in range(0, total, _EMBED_BATCH):
-        vectors.extend(embed_texts(chunks[start : start + _EMBED_BATCH]))
-        report(min(start + _EMBED_BATCH, total), total)
+    for start in range(0, total, size):
+        vectors.extend(embed_texts(chunks[start : start + size]))
+        report(min(start + size, total), total)
     return vectors
 
 
@@ -577,7 +581,7 @@ def _run_sync_job(
         to_sync = []
         for entry in target_files:
             eid, tag = entry.get("external_id"), entry.get("version_tag")
-            if eid and tag and known_unreadable.get(eid) == tag:
+            if eid and tag and known_unreadable.get(eid) == cloud_sync.unreadable_key(tag):
                 res = cloud_sync.unreadable_result(entry)
                 results.append(res)
                 cloud_sync._add_item(db, job_id, res)
@@ -631,7 +635,7 @@ def _run_sync_job(
         cloud_sync.set_unreadable_map(
             connection,
             {
-                r.external_id: tags[r.external_id]
+                r.external_id: cloud_sync.unreadable_key(tags[r.external_id])
                 for r in results
                 if getattr(r, "unreadable", False) and r.external_id and tags.get(r.external_id)
             },
@@ -815,10 +819,11 @@ def start_due_syncs(db: Session) -> list[int]:
 
 
 def _warm_up_model() -> None:
-    """Loads the embedding model in the background at start-up, so the first
-    upload or sync doesn't sit at "Creating embeddings 0 of N" while it loads."""
+    """Loads the local embedding model in the background at start-up, so the first
+    upload or sync doesn't sit at "Creating embeddings 0 of N" while it loads.
+    With Voyage AI there is no model to load (nothing is sent)."""
     try:
-        embed_texts(["warm-up"])
+        warm_up()
     except Exception:  # noqa: BLE001
         logger.exception("Embedding model warm-up failed (it will load on first use)")
 

@@ -54,7 +54,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.models import Document, IngestionJob, IngestionJobItem, SourceConnection, User
-from app.services import app_settings, doc_history, googledrive_source, onedrive_auth, onedrive_source
+from app.services import app_settings, doc_history, googledrive_source, ocr, onedrive_auth, onedrive_source
 from app.services.doc_matching import doc_year, text_shingles
 from app.services.embeddings import embed_texts
 from app.services.ingestion import (
@@ -627,15 +627,32 @@ UNREADABLE_DETAIL = (
 )
 
 
-def unreadable_result(entry: dict) -> FileResult:
+UNREADABLE_DETAIL_OCR = (
+    "No text found, even after reading its pages with Claude -- it may be blank or contain "
+    "only pictures, so it can't be used in the chat."
+)
+
+
+def unreadable_result(entry: dict, detail: Optional[str] = None) -> FileResult:
+    if detail is None:
+        detail = UNREADABLE_DETAIL_OCR if ocr.enabled() else UNREADABLE_DETAIL
     return FileResult(
-        entry["path"], "skipped", UNREADABLE_DETAIL,
+        entry["path"], "skipped", detail,
         external_id=entry.get("external_id"), outcome="unreadable", unreadable=True,
     )
 
 
 def _is_no_text(exc: Exception) -> bool:
     return isinstance(exc, HTTPException) and "No extractable text found" in str(exc.detail)
+
+
+def unreadable_key(version_tag: str) -> str:
+    """
+    What unreadable_map stores per file: its version tag, plus a marker for
+    the OCR setting (see ocr.skip_marker) -- so switching OCR on, or raising
+    OCR_MAX_PAGES, makes the next sync try those files again.
+    """
+    return f"{ocr.skip_marker()}{version_tag}"
 
 
 def unreadable_map(connection: SourceConnection) -> dict:
@@ -660,7 +677,9 @@ def failure_result(entry: dict, exc: Exception) -> FileResult:
     if _is_no_text(exc):
         # Not an error with the sync: the file has no text (scanned / image
         # only). Shown as Skipped, so the folder doesn't turn "partial".
-        return unreadable_result(entry)
+        # Too many scanned pages for OCR_MAX_PAGES: say so instead.
+        detail = str(exc.detail)
+        return unreadable_result(entry, detail if "OCR_MAX_PAGES" in detail else None)
     detail = exc.detail if isinstance(exc, HTTPException) else (str(exc)[:300] or exc.__class__.__name__)
     if not isinstance(exc, HTTPException):
         logger.exception("Sync of %s failed", entry.get("path"))

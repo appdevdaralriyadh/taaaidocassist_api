@@ -78,6 +78,7 @@ from app.services.doc_matching import (
     two_way_similarity,
 )
 from app.services.embeddings import embed_texts, to_vector_literal
+from app.services import ocr
 from app.services.parsing import extract_text
 
 
@@ -155,7 +156,10 @@ def _extract_chunks(filename: str, content: bytes) -> list[str]:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                f"No extractable text found in '{filename}' "
+                f"No extractable text found in '{filename}', even after reading its pages "
+                "with Claude (it may be blank or contain only pictures)."
+                if ocr.enabled() and filename.lower().endswith(".pdf")
+                else f"No extractable text found in '{filename}' "
                 "(possibly a scanned/image-only file)."
             ),
         )

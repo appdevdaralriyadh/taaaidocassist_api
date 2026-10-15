@@ -42,6 +42,7 @@ from app.schemas import (
     DebugRetrievalResponse,
 )
 from app.services import retrieval
+from app.services.embeddings import EmbeddingServiceError
 
 router = APIRouter()
 logger = logging.getLogger("darai.chat")
@@ -88,18 +89,30 @@ def send_message(
 ):
     conversation_id = payload.conversation_id or uuid.uuid4()
 
-    matches = retrieval.search(db, payload.message)
+    try:
+        matches = retrieval.search(db, payload.message)
+    except EmbeddingServiceError as exc:
+        # The document search itself failed (e.g. Voyage AI unreachable):
+        # say so, rather than quietly answering from general knowledge.
+        logger.warning("conversation=%s document search unavailable: %s", conversation_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Document search is temporarily unavailable -- {exc}",
+        )
     used_documents = len(matches) > 0
     sources = sorted({m.filename for m in matches}) if used_documents else []
 
-    best_distance = matches[0].distance if matches else None
+    # min(), not matches[0]: with the reranker on, matches are in reranker order.
+    best_distance = min((m.distance for m in matches), default=None)
+    best_rerank = matches[0].rerank_score if matches else None
     logger.info(
-        "conversation=%s route=%s best_distance=%s max_distance=%.2f matched_chunks=%d",
+        "conversation=%s route=%s best_distance=%s max_distance=%.2f matched_chunks=%d rerank_score=%s",
         conversation_id,
         "knowledge_base" if used_documents else "general",
         f"{best_distance:.3f}" if best_distance is not None else "n/a",
         settings.MAX_COSINE_DISTANCE,
         len(matches),
+        f"{best_rerank:.3f}" if best_rerank is not None else "n/a",
     )
 
     system_prompt = (
@@ -342,16 +355,27 @@ def debug_retrieval(
     Runs the same embed + vector-distance search used to route live chat
     messages, without calling Claude -- for tuning MAX_COSINE_DISTANCE /
     TOP_K_CHUNKS against your real documents without burning API calls.
+    With RERANK_MODEL set, the reranker runs too (one Voyage AI rerank call)
+    and each match shows its rerank_score, in reranker order.
     """
     effective_max_distance = (
         settings.MAX_COSINE_DISTANCE if max_distance is None else max_distance
     )
-    matches = retrieval.search(db, q, max_distance=effective_max_distance)
+    try:
+        matches = retrieval.search(db, q, max_distance=effective_max_distance)
+    except EmbeddingServiceError as exc:
+        raise HTTPException(status_code=503, detail=f"Document search is unavailable -- {exc}")
     return DebugRetrievalResponse(
         query=q,
         max_distance=effective_max_distance,
+        rerank_model=settings.RERANK_MODEL.strip() or None,
         matches=[
-            DebugRetrievalChunk(filename=m.filename, distance=m.distance, chunk_text=m.chunk_text)
+            DebugRetrievalChunk(
+                filename=m.filename,
+                distance=m.distance,
+                chunk_text=m.chunk_text,
+                rerank_score=m.rerank_score,
+            )
             for m in matches
         ],
     )
