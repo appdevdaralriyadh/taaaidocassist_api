@@ -246,19 +246,15 @@ class Settings(BaseSettings):
     # (higher = better) this setting used to gate on. LOWER is better
     # here -- do not read this the old way.
     #
-    # This replaces the old SIMILARITY_THRESHOLD setting (removed, not
-    # kept alongside this one -- two settings with inverted meaning is a
-    # standing invitation to use the wrong one by accident). 0.35 is a
-    # straight mechanical conversion of that setting's last value
-    # (distance = 1 - similarity => 1 - 0.65 = 0.35), NOT a re-tuning --
-    # and that old 0.65 was itself never actually re-validated after two
-    # prior embedding-model switches (MiniLM -> bge-m3 ->
-    # bge-large-en-v1.5). Treat 0.35 as an unvalidated placeholder until
-    # real distances are captured via GET /api/chat/debug-retrieval's
-    # `max_distance` override param (both a known-good match and a
-    # known-irrelevant query) against the current model on the actual SQL
-    # Server 2025 database, and re-tune from there.
-    MAX_COSINE_DISTANCE: float = 0.35
+    # Tuned for Voyage AI embeddings on the real knowledge base, checked
+    # with GET /api/chat/debug-retrieval?q=...&max_distance=2:
+    #   relevant question ("men dress code")      -> 0.44 - 0.58
+    #   unrelated question ("capital of France")  -> 0.78 - 0.83
+    # 0.6 sits between the two. The old 0.35 was for the earlier local model
+    # (bge) and let nothing through with Voyage. Re-check with the same two
+    # kinds of question whenever EMBEDDING_MODEL changes. With the reranker
+    # on, RERANK_MIN_SCORE (e.g. 0.45) is a second guard against weak matches.
+    MAX_COSINE_DISTANCE: float = 0.6
     TOP_K_CHUNKS: int = 5
 
     # --- Background uploads / syncs (app/services/jobs.py) ---
