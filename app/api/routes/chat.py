@@ -81,6 +81,35 @@ def _build_context_block(chunks: list[retrieval.RetrievedChunk]) -> str:
     return "\n\n".join(f"[Source: {c.filename}]\n{c.chunk_text}" for c in chunks)
 
 
+# Each person sees and uses only their own conversations. A conversation
+# belongs to whoever started it (DarAI_Conversations.UserId); for a very old
+# one with no DarAI_Conversations row, to whoever sent its first message.
+# Someone else's conversation is answered with 404 "not found" -- not 403 --
+# so the API doesn't even confirm it exists. (Role-based access, e.g. an
+# admin who can see everyone's chats, is planned separately.)
+_NOT_FOUND = "Conversation not found."
+
+
+def _conversation_owner(db: Session, conversation_id: uuid.UUID) -> Optional[int]:
+    """UserId of the conversation's owner, or None if the conversation doesn't exist."""
+    row = db.query(Conversation.UserId).filter(Conversation.ConversationId == conversation_id).first()
+    if row is not None:
+        return row[0]
+    first = (
+        db.query(ChatMessage.UserId)
+        .filter(ChatMessage.ConversationId == conversation_id)
+        .order_by(asc(ChatMessage.CreatedAt), asc(ChatMessage.Id))
+        .first()
+    )
+    return first[0] if first is not None else None
+
+
+def _require_own_conversation(db: Session, conversation_id: uuid.UUID, user: User) -> None:
+    """404 unless the conversation exists and belongs to `user`."""
+    if _conversation_owner(db, conversation_id) != user.Id:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+
+
 @router.post("/message", response_model=ChatMessageResponse)
 def send_message(
     payload: ChatMessageRequest,
@@ -88,6 +117,12 @@ def send_message(
     db: Session = Depends(get_db),
 ):
     conversation_id = payload.conversation_id or uuid.uuid4()
+    if payload.conversation_id is not None:
+        # Continuing a chat: only your own. An ID that hasn't been used yet
+        # simply starts a new conversation.
+        owner = _conversation_owner(db, conversation_id)
+        if owner is not None and owner != user.Id:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     try:
         matches = retrieval.search(db, payload.message)
@@ -122,9 +157,7 @@ def send_message(
     )
 
     # Recent history for this conversation gives the model continuity
-    # (spec §3.5). Not filtered by UserId: either account can see either
-    # account's history, so if the admin continues a user's conversation
-    # the model should see the same thread they saw.
+    # (spec §3.5). The conversation was checked above to be the caller's own.
     history = (
         db.query(ChatMessage)
         .filter(ChatMessage.ConversationId == conversation_id)
@@ -209,11 +242,11 @@ def send_message(
 @router.get("/history/{conversation_id}", response_model=list[ChatHistoryItem])
 def get_history(
     conversation_id: uuid.UUID,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Either account can view either account's chat history (spec §3.5) --
-    # deliberately not filtered by UserId, only by conversation.
+    # Only the signed-in user's own conversations can be opened.
+    _require_own_conversation(db, conversation_id, user)
     rows = (
         db.query(ChatMessage)
         .filter(ChatMessage.ConversationId == conversation_id)
@@ -233,15 +266,19 @@ def get_history(
 
 @router.get("/conversations", response_model=list[ConversationListItem])
 def list_conversations(
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Backs the Angular sidebar's conversation list. Shared visibility, same
-    as get_history() above -- every conversation is returned regardless of
-    which account started it, not just the caller's own.
+    Backs the Angular sidebar's conversation list: only the signed-in
+    user's own conversations, most recent first.
     """
-    rows = db.query(Conversation).order_by(desc(Conversation.LastMessageAt)).all()
+    rows = (
+        db.query(Conversation)
+        .filter(Conversation.UserId == user.Id)
+        .order_by(desc(Conversation.LastMessageAt))
+        .all()
+    )
     return [
         ConversationListItem(id=r.ConversationId, title=r.Title, last_message_at=r.LastMessageAt)
         for r in rows
@@ -252,12 +289,17 @@ def list_conversations(
 def rename_conversation(
     conversation_id: uuid.UUID,
     payload: ConversationRenameRequest,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    row = db.query(Conversation).filter(Conversation.ConversationId == conversation_id).one_or_none()
+    # Own conversations only -- someone else's is "not found"
+    row = (
+        db.query(Conversation)
+        .filter(Conversation.ConversationId == conversation_id, Conversation.UserId == user.Id)
+        .one_or_none()
+    )
     if row is None:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     title = payload.title.strip()
     if not title:
@@ -272,18 +314,22 @@ def rename_conversation(
 @router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
 def delete_conversation(
     conversation_id: uuid.UUID,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Permanently removes the conversation and every message in it (matches
     the sidebar's "will be permanently removed" delete-confirmation copy).
-    Not restricted to the caller's own conversation -- consistent with
-    get_history()/list_conversations()'s shared-visibility design.
+    Only the signed-in user's own conversation -- someone else's is "not
+    found" and nothing is deleted.
     """
-    row = db.query(Conversation).filter(Conversation.ConversationId == conversation_id).one_or_none()
+    row = (
+        db.query(Conversation)
+        .filter(Conversation.ConversationId == conversation_id, Conversation.UserId == user.Id)
+        .one_or_none()
+    )
     if row is None:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     messages_deleted = (
         db.query(ChatMessage)
@@ -303,10 +349,9 @@ def clear_my_conversations(
     """
     Backs the sidebar's "Clear All" -- deliberately scoped to the caller's
     OWN conversations only (Conversation.UserId, i.e. whoever's first
-    message created each one), unlike the shared-visibility endpoints
-    above. A bulk destructive action from a single click shouldn't also be
-    able to wipe the other account's conversations; that's what Data
-    Management's typed-confirmation "clear chat history" flow is for.
+    message created each one), like every endpoint above. Clearing other
+    accounts' history is Data Management's typed-confirmation "clear chat
+    history" flow.
     """
     conversation_ids = [
         row.ConversationId

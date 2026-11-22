@@ -109,11 +109,10 @@ class Conversation(Base):
 
     Created by app/api/routes/chat.py's send_message() the first time a
     given ConversationId is used, and updated (LastMessageAt) on every
-    later message. Listing/renaming/deleting a conversation is NOT
-    restricted to the UserId that created it, matching this app's existing
-    shared-visibility design for chat history (see get_history()'s
-    comment and ClearChatHistoryRequest, which already let either account
-    act on either account's history).
+    later message. UserId is the conversation's owner: listing, opening,
+    continuing, renaming and deleting a conversation are limited to it (see
+    app/api/routes/chat.py). Data Management's ClearChatHistoryRequest can
+    still clear any account's history.
     """
 
     __tablename__ = "DarAI_Conversations"
