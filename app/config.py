@@ -255,6 +255,10 @@ class Settings(BaseSettings):
     # kinds of question whenever EMBEDDING_MODEL changes. With the reranker
     # on, RERANK_MIN_SCORE (e.g. 0.45) is a second guard against weak matches.
     MAX_COSINE_DISTANCE: float = 0.6
+
+    # Time zone for the "current date and time" given to Claude with every
+    # chat message (Claude has no clock of its own). IANA name.
+    APP_TIMEZONE: str = "Asia/Riyadh"
     TOP_K_CHUNKS: int = 5
 
     # --- Background uploads / syncs (app/services/jobs.py) ---

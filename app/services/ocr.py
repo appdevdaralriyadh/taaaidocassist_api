@@ -218,7 +218,13 @@ def _ask_claude(pdf: bytes, page_indexes: list[int], filename: str) -> tuple[str
     """(text, cut off because it ran out of output room)"""
     started = time.perf_counter()
     try:
-        response = _get_client().messages.create(
+        # Streamed, not a plain messages.create(): typing out a group of dense
+        # pages can take longer than OCR_TIMEOUT_SECONDS, and without streaming
+        # nothing arrives until Claude has finished, so the wait timed out
+        # ("Request timed out or interrupted") and every retry started over.
+        # Streamed, text keeps arriving, and OCR_TIMEOUT_SECONDS only applies
+        # when the connection really goes quiet.
+        with _get_client().messages.stream(
             model=model(),
             max_tokens=settings.OCR_MAX_OUTPUT_TOKENS,
             messages=[
@@ -237,7 +243,8 @@ def _ask_claude(pdf: bytes, page_indexes: list[int], filename: str) -> tuple[str
                     ],
                 }
             ],
-        )
+        ) as stream:
+            response = stream.get_final_message()
     except Exception as exc:  # noqa: BLE001 -- anthropic.* errors and network errors
         logger.warning("Claude OCR call failed for %s: %s: %s", filename, exc.__class__.__name__, exc)
         raise OcrUnavailableError(_error_message(exc)) from exc

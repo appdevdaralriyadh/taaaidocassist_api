@@ -5,12 +5,21 @@ Each message is embedded and checked against the shared knowledge base via
 app/services/retrieval.py's SQL Server VECTOR_DISTANCE search. Clearing
 MAX_COSINE_DISTANCE *is* the routing decision -- there's no separate
 classifier call:
-  - At or below the cutoff -> answer generated from the matched chunks,
-    with a deterministic "Source: filename" citation appended to what
-    gets persisted (never left to the model to cite reliably on its
-    own), UsedDocuments=True.
+  - At or below the cutoff -> Claude gets the matched chunks and answers
+    from them when they contain the answer, with a deterministic "Source:
+    filename" citation appended to what gets persisted (never left to the
+    model to cite reliably on its own), UsedDocuments=True. When the chunks
+    are only loosely related and don't answer a general question (e.g. a
+    National Day newsletter for "who is the King of Saudi Arabia?"), Claude
+    answers from general knowledge instead and says so with a marker line,
+    which turns the answer into a GENERAL KNOWLEDGE one (no sources). A
+    question about the company itself that the documents don't cover is
+    still answered "not in the documents", never guessed.
   - Above the cutoff, or an empty knowledge base -> general knowledge,
     same behavior as Phase 1, UsedDocuments=False.
+
+Every prompt also carries the current date and time (APP_TIMEZONE, Saudi
+time by default), since Claude has no clock of its own.
 
 Every message logs which path was taken and the best (lowest) distance --
 spec §3.4: "useful for debugging the classifier/threshold over time."
@@ -18,8 +27,11 @@ Note this is a DISTANCE, not the old similarity score -- lower is better.
 """
 
 import logging
+import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from anthropic import Anthropic
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -62,19 +74,64 @@ def _make_title(first_message: str) -> str:
 
 _client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-_GENERAL_SYSTEM_PROMPT = (
-    "You are a helpful assistant embedded in an internal document "
-    "processing and chat application. Answer from your general knowledge."
+_GENERAL_SYSTEM_PROMPT_TEMPLATE = (
+    "You are Document AI Assist, a helpful assistant in Dar Al Riyadh's "
+    "internal document processing and chat application. Answer from your "
+    "general knowledge.\n\n{now}"
 )
 
+# The marker lines Claude starts a knowledge-base reply with; removed before
+# the reply is shown or stored. [[GENERAL]] = the passages didn't answer it.
+_MARKER_DOCUMENTS = "[[DOCUMENTS]]"
+_MARKER_GENERAL = "[[GENERAL]]"
+_MARKER_RE = re.compile(r"^\s*\[\[(DOCUMENTS|GENERAL)\]\]\s*", re.IGNORECASE)
+
 _KB_SYSTEM_PROMPT_TEMPLATE = (
-    "You are a helpful assistant embedded in an internal document "
-    "processing and chat application. Answer the user's question using "
-    "ONLY the context below, drawn from the shared document knowledge "
-    "base. If the context doesn't actually contain the answer, say so "
-    "plainly rather than guessing or falling back to outside knowledge.\n\n"
+    "You are Document AI Assist, a helpful assistant in Dar Al Riyadh's "
+    "internal document processing and chat application. Below are passages "
+    "from the company's shared document knowledge base that may relate to "
+    "the user's question.\n\n"
+    "- If the passages contain the answer, answer using them.\n"
+    "- If they don't, and the question is about Dar Al Riyadh itself (its "
+    "policies, procedures, people, projects or other internal matters), say "
+    "plainly that the documents don't cover it. Don't guess.\n"
+    "- If they don't, and it's a general question (facts about the world, "
+    "dates and times, definitions, how-to), answer it from your general "
+    "knowledge.\n\n"
+    f"Start your reply with exactly one marker line: {_MARKER_DOCUMENTS} if "
+    f"your answer is based on the passages or says the documents don't "
+    f"cover it, or {_MARKER_GENERAL} if you answered from general "
+    "knowledge. The marker is removed before the user sees the reply.\n\n"
+    "{now}\n\n"
     "--- CONTEXT ---\n{context}\n--- END CONTEXT ---"
 )
+
+
+def _now_line() -> str:
+    """'Current date and time: ...' in APP_TIMEZONE -- Claude has no clock of its own."""
+    try:
+        tz = ZoneInfo(settings.APP_TIMEZONE)
+        tz_name = settings.APP_TIMEZONE
+    except (ZoneInfoNotFoundError, ValueError):
+        # e.g. Windows without the tzdata package: Saudi time has no DST, so
+        # a fixed +03:00 is exact for the default
+        logger.warning("Time zone %r not available -- using UTC+03:00", settings.APP_TIMEZONE)
+        tz, tz_name = timezone(timedelta(hours=3)), "UTC+03:00"
+    now = datetime.now(tz)
+    offset = now.strftime("%z")
+    return (
+        f"Current date and time: {now:%A}, {now.day} {now:%B %Y}, {now:%H:%M} "
+        f"({tz_name}, UTC{offset[:3]}:{offset[3:]}). Use it for questions about "
+        "today's date or the current time."
+    )
+
+
+def _split_marker(reply: str) -> tuple[str, Optional[str]]:
+    """Removes the leading marker line; returns (reply, 'DOCUMENTS' | 'GENERAL' | None)."""
+    match = _MARKER_RE.match(reply)
+    if not match:
+        return reply, None
+    return reply[match.end():], match.group(1).upper()
 
 
 def _build_context_block(chunks: list[retrieval.RetrievedChunk]) -> str:
@@ -150,10 +207,11 @@ def send_message(
         f"{best_rerank:.3f}" if best_rerank is not None else "n/a",
     )
 
+    now = _now_line()
     system_prompt = (
-        _KB_SYSTEM_PROMPT_TEMPLATE.format(context=_build_context_block(matches))
+        _KB_SYSTEM_PROMPT_TEMPLATE.format(context=_build_context_block(matches), now=now)
         if used_documents
-        else _GENERAL_SYSTEM_PROMPT
+        else _GENERAL_SYSTEM_PROMPT_TEMPLATE.format(now=now)
     )
 
     # Recent history for this conversation gives the model continuity
@@ -177,6 +235,14 @@ def send_message(
     reply_text = "".join(
         block.text for block in response.content if block.type == "text"
     )
+    if used_documents:
+        reply_text, marker = _split_marker(reply_text)
+        if marker == "GENERAL":
+            # The passages didn't answer it: shown and stored as a general-
+            # knowledge answer, without document sources
+            used_documents = False
+            sources = []
+            logger.info("conversation=%s route=general_fallback (passages didn't answer it)", conversation_id)
 
     # The citation is appended deterministically from the chunks actually
     # retrieved -- never left to the model to cite correctly on its own --

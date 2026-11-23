@@ -48,3 +48,5 @@ google-auth>=2.29
 
 # --- Config / environment ---
 python-dotenv>=1.0
+# Time-zone data for APP_TIMEZONE (Windows has no built-in IANA database)
+tzdata>=2024.1
